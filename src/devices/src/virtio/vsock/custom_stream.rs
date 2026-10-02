@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::collections::HashMap;
 
-use utils::epoll::EventSet;
+use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 
 use super::super::Queue as VirtQueue;
@@ -29,6 +29,8 @@ pub struct CustomStreamProxy {
     cid: u64,
     backend: Box<dyn VsockStreamBackend>,
     notifier: VsockNotifier,
+    epoll: Arc<Epoll>,
+    waiting_rx: bool,
     status: ProxyStatus,
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
@@ -56,6 +58,7 @@ impl CustomStreamProxy {
         peer_port: u32,
         backend: Box<dyn VsockStreamBackend>,
         notifier: VsockNotifier,
+        epoll: Arc<Epoll>,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
@@ -70,6 +73,8 @@ impl CustomStreamProxy {
             cid,
             backend,
             notifier,
+            epoll,
+            waiting_rx: false,
             status,
             mem,
             queue,
@@ -124,9 +129,49 @@ impl CustomStreamProxy {
     }
 
     fn clear_notification(&self) {
-        if self.uses_notifier() {
-            if let Err(err) = self.notifier.clear() {
-                warn!("failed to clear custom vsock notification: {err}");
+        if let Err(err) = self.notifier.clear() {
+            warn!("failed to clear custom vsock notification: {err}");
+        }
+    }
+
+    // Apply interest changes while the proxy lock still protects its state.
+    // Returning a polling update for later application could overwrite a newer
+    // pause/resume decision from the guest thread with stale socket interests.
+    fn update_polling(&self) {
+        let mut events = match self.status {
+            ProxyStatus::Connecting => self.connecting_poll_events(),
+            ProxyStatus::Connected => self.connected_poll_events(),
+            _ => EventSet::empty(),
+        };
+        if self.waiting_rx && !self.uses_notifier() {
+            events.remove(EventSet::IN);
+        }
+        self.poll(self.event_pollable(), events);
+
+        // A socket's hang-up is level-triggered. Stop watching it when RX is
+        // full, but retain the notifier so a guest buffer kick can resume reads.
+        if !self.uses_notifier() {
+            self.poll(
+                self.notifier.pollable(),
+                if self.waiting_rx && self.status == ProxyStatus::Connected {
+                    EventSet::IN
+                } else {
+                    EventSet::empty()
+                },
+            );
+        }
+    }
+
+    fn poll(&self, fd: VsockPollable, events: EventSet) {
+        let _ = self
+            .epoll
+            .ctl(ControlOperation::Delete, fd, &EpollEvent::default());
+        if !events.is_empty() {
+            if let Err(err) =
+                self.epoll
+                    .ctl(ControlOperation::Add, fd, &EpollEvent::new(events, self.id))
+            {
+                warn!("failed to update custom vsock polling: {err}");
             }
         }
     }
@@ -161,55 +206,74 @@ impl CustomStreamProxy {
         (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
     }
 
-    fn recv_to_pkt(&self, pkt: &mut VsockPacket) -> RecvPkt {
+    fn recv_to_pkt(&self, pkt: &mut VsockPacket) -> io::Result<RecvPkt> {
         let Some(buf) = pkt.buf_mut() else {
-            return RecvPkt::Error;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing vsock receive buffer",
+            ));
         };
         let max_len = buf.len().min(self.peer_avail_credit());
         if max_len == 0 {
-            return RecvPkt::WaitForCredit;
+            return Ok(RecvPkt::WaitForCredit);
         }
 
         match self.backend.read(&mut buf[..max_len]) {
-            Ok(0) => RecvPkt::Close,
-            Ok(count) if count <= max_len => RecvPkt::Read(count),
+            Ok(0) => Ok(RecvPkt::Close),
+            Ok(count) if count <= max_len => Ok(RecvPkt::Read(count)),
             Ok(count) => {
                 warn!(
                     "vsock backend returned invalid read length: count={count}, capacity={max_len}"
                 );
-                RecvPkt::Error
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "vsock backend read exceeded buffer",
+                ))
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => RecvPkt::Error,
-            Err(err) => {
-                debug!("custom vsock backend read failed: {err}");
-                RecvPkt::Error
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(RecvPkt::Error)
             }
+            Err(err) => Err(err),
         }
     }
 
-    fn recv_pkt(&mut self) -> (bool, bool) {
+    fn recv_pkt(&mut self) -> io::Result<(bool, bool)> {
         let mut have_used = false;
         let mut wait_credit = false;
         let mut queue = self.queue.lock().unwrap();
 
-        while let Some(head) = queue.pop(&self.mem) {
+        self.waiting_rx = false;
+        loop {
+            let Some(head) = queue.pop(&self.mem) else {
+                self.waiting_rx = true;
+                break;
+            };
             let len = match VsockPacket::from_rx_virtq_head(&head) {
                 Ok(mut pkt) => match self.recv_to_pkt(&mut pkt) {
-                    RecvPkt::WaitForCredit => {
+                    Err(err) => {
+                        queue.undo_pop();
+                        return Err(err);
+                    }
+                    Ok(RecvPkt::WaitForCredit) => {
                         wait_credit = true;
                         0
                     }
-                    RecvPkt::Read(count) => {
+                    Ok(RecvPkt::Read(count)) => {
                         self.rx_cnt += Wrapping(count as u32);
                         self.init_data_pkt(&mut pkt);
                         pkt.set_len(count as u32);
                         pkt.hdr().len() + count
                     }
-                    RecvPkt::Close => {
+                    Ok(RecvPkt::Close) => {
                         self.status = ProxyStatus::Closed;
                         0
                     }
-                    RecvPkt::Error => 0,
+                    Ok(RecvPkt::Error) => 0,
                 },
                 Err(err) => {
                     debug!("custom vsock RX queue error: {err:?}");
@@ -227,7 +291,7 @@ impl CustomStreamProxy {
             }
         }
 
-        (have_used, wait_credit)
+        Ok((have_used, wait_credit))
     }
 
     fn flush_pending_write(&mut self) -> io::Result<usize> {
@@ -294,7 +358,7 @@ impl CustomStreamProxy {
         self.status = ProxyStatus::Closed;
         update.signal_queue = true;
         update.remove_proxy = ProxyRemoval::Deferred;
-        update.polling = Some((self.id, self.event_pollable(), EventSet::empty()));
+        self.update_polling();
     }
 }
 
@@ -371,7 +435,7 @@ impl Proxy for CustomStreamProxy {
             self.fail(&mut update, "custom vsock backend write failed", &err);
             return update;
         }
-        update.polling = Some((self.id, self.event_pollable(), self.connected_poll_events()));
+        self.update_polling();
         self.maybe_push_credit_update(&mut update);
 
         update
@@ -403,20 +467,16 @@ impl Proxy for CustomStreamProxy {
         self.status = ProxyStatus::Connected;
         self.kick();
 
-        ProxyUpdate {
-            polling: Some((self.id, self.event_pollable(), self.connected_poll_events())),
-            ..Default::default()
-        }
+        self.update_polling();
+        ProxyUpdate::default()
     }
 
     fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
         self.peer_buf_alloc = pkt.buf_alloc();
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
         self.status = ProxyStatus::Connected;
-        ProxyUpdate {
-            polling: Some((self.id, self.event_pollable(), self.connected_poll_events())),
-            ..Default::default()
-        }
+        self.update_polling();
+        ProxyUpdate::default()
     }
 
     fn shutdown(&mut self, pkt: &VsockPacket) {
@@ -434,8 +494,8 @@ impl Proxy for CustomStreamProxy {
 
     fn release(&mut self) -> ProxyUpdate {
         self.status = ProxyStatus::Closed;
+        self.update_polling();
         ProxyUpdate {
-            polling: Some((self.id, self.event_pollable(), EventSet::empty())),
             remove_proxy: ProxyRemoval::Immediate,
             ..Default::default()
         }
@@ -444,21 +504,11 @@ impl Proxy for CustomStreamProxy {
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
-        if evset.contains(EventSet::HANG_UP) {
-            let err = io::Error::new(io::ErrorKind::ConnectionReset, "backend event closed");
-            self.fail(&mut update, "custom vsock backend closed", &err);
-            return update;
-        }
-
         if self.status == ProxyStatus::Connecting {
             self.clear_notification();
             match self.backend.connect_state() {
                 Ok(VsockConnectState::Connecting) => {
-                    update.polling = Some((
-                        self.id,
-                        self.event_pollable(),
-                        self.connecting_poll_events(),
-                    ));
+                    self.update_polling();
                     return update;
                 }
                 Ok(VsockConnectState::Connected) => {
@@ -483,8 +533,19 @@ impl Proxy for CustomStreamProxy {
             self.maybe_push_credit_update(&mut update);
         }
 
-        if self.status == ProxyStatus::Connected && evset.contains(EventSet::IN) {
-            let (signal_queue, wait_credit) = self.recv_pkt();
+        // A hang-up can arrive with unread host bytes (including macOS EV_EOF).
+        // Drain through the normal credit/virtqueue path and close only after
+        // read returns EOF. If the guest is blocked, keep the proxy for a retry.
+        if self.status == ProxyStatus::Connected
+            && evset.intersects(EventSet::IN | EventSet::HANG_UP | EventSet::READ_HANG_UP)
+        {
+            let (signal_queue, wait_credit) = match self.recv_pkt() {
+                Ok(result) => result,
+                Err(err) => {
+                    self.fail(&mut update, "custom vsock backend read failed", &err);
+                    return update;
+                }
+            };
             update.signal_queue |= signal_queue;
             if wait_credit {
                 self.status = ProxyStatus::WaitingCreditUpdate;
@@ -498,21 +559,13 @@ impl Proxy for CustomStreamProxy {
             if self.status == ProxyStatus::Closed {
                 self.push_reset();
                 update.signal_queue = true;
-                update.polling = Some((self.id, self.event_pollable(), EventSet::empty()));
+                self.update_polling();
                 update.remove_proxy = ProxyRemoval::Immediate;
                 return update;
             }
         }
 
-        update.polling = Some((
-            self.id,
-            self.event_pollable(),
-            if self.status == ProxyStatus::WaitingCreditUpdate {
-                EventSet::empty()
-            } else {
-                self.connected_poll_events()
-            },
-        ));
+        self.update_polling();
         update
     }
 
@@ -613,6 +666,7 @@ mod tests {
             4000,
             Box::new(TestStream { state }),
             VsockNotifier::new().unwrap(),
+            Arc::new(Epoll::new().unwrap()),
             mem,
             Arc::new(Mutex::new(VirtQueue::new(256))),
             Arc::new(Mutex::new(MuxerRxQ::new())),
@@ -675,5 +729,195 @@ mod tests {
 
         assert!(matches!(update.remove_proxy, ProxyRemoval::Immediate));
         assert_eq!(proxy.pending_write.len(), defs::CONN_TX_BUF_SIZE);
+    }
+
+    /// Exercise the proxy-to-guest boundary with unread bytes in a real socket.
+    /// Neither a hang-up nor temporary guest backpressure may discard the tail.
+    #[cfg(unix)]
+    #[test]
+    fn drains_hung_up_stream_before_reset() {
+        use std::io::{Read, Write};
+        use std::net::Shutdown;
+        use std::os::fd::{AsRawFd, RawFd};
+        use std::os::unix::net::UnixStream;
+
+        struct SocketBackend(UnixStream);
+
+        impl VsockStreamBackend for SocketBackend {
+            fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+                (&self.0).read(buf)
+            }
+
+            fn write(&self, buf: &[u8]) -> io::Result<usize> {
+                (&self.0).write(buf)
+            }
+
+            fn shutdown(&self, how: VsockShutdown) -> io::Result<()> {
+                self.0.shutdown(match how {
+                    VsockShutdown::Read => Shutdown::Read,
+                    VsockShutdown::Write => Shutdown::Write,
+                    VsockShutdown::Both => Shutdown::Both,
+                })
+            }
+
+            fn pollable(&self) -> Option<RawFd> {
+                Some(self.0.as_raw_fd())
+            }
+        }
+
+        const DESC: u64 = 0x1000;
+        const AVAIL: u64 = 0x2000;
+        const USED: u64 = 0x3000;
+        const DATA: u64 = 0x4000;
+        const STRIDE: u64 = 0x2000;
+        const CHUNK: usize = 4096;
+
+        for half_close in [false, true] {
+            for event in [EventSet::HANG_UP, EventSet::IN | EventSet::HANG_UP] {
+                for pause in ["none", "credit", "descriptors"] {
+                    let payload: Vec<u8> = (0..CHUNK * 2).map(|i| (i % 251) as u8).collect();
+                    let (mut host, backend) = UnixStream::pair().unwrap();
+                    backend.set_nonblocking(true).unwrap();
+                    host.write_all(&payload).unwrap();
+                    let _host = if half_close {
+                        host.shutdown(Shutdown::Write).unwrap();
+                        Some(host)
+                    } else {
+                        drop(host);
+                        None
+                    };
+
+                    let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+                    let mut queue = VirtQueue::new(8);
+                    queue.size = 8;
+                    queue.ready = true;
+                    queue.desc_table = GuestAddress(DESC);
+                    queue.avail_ring = GuestAddress(AVAIL);
+                    queue.used_ring = GuestAddress(USED);
+                    // Two data buffers and one buffer for the terminal reset.
+                    for i in 0..3u16 {
+                        mem.write_obj(
+                            Descriptor {
+                                addr: DATA + u64::from(i) * STRIDE,
+                                len: (VSOCK_PKT_HDR_SIZE + CHUNK) as u32,
+                                flags: 2,
+                                next: 0,
+                            },
+                            GuestAddress(DESC + u64::from(i) * 16),
+                        )
+                        .unwrap();
+                        mem.write_obj(i, GuestAddress(AVAIL + 4 + u64::from(i) * 2))
+                            .unwrap();
+                    }
+                    mem.write_obj(
+                        if pause == "descriptors" { 1u16 } else { 3u16 },
+                        GuestAddress(AVAIL + 2),
+                    )
+                    .unwrap();
+                    let epoll = Arc::new(Epoll::new().unwrap());
+                    let mut proxy = CustomStreamProxy::new(
+                        1,
+                        3,
+                        5000,
+                        4000,
+                        Box::new(SocketBackend(backend)),
+                        VsockNotifier::new().unwrap(),
+                        epoll.clone(),
+                        mem.clone(),
+                        Arc::new(Mutex::new(queue)),
+                        Arc::new(Mutex::new(MuxerRxQ::new())),
+                    )
+                    .unwrap();
+                    proxy.peer_buf_alloc = if pause == "credit" {
+                        CHUNK as u32
+                    } else {
+                        (CHUNK * 4) as u32
+                    };
+
+                    let mut update = proxy.process_event(event);
+                    if pause != "none" {
+                        assert!(
+                            matches!(update.remove_proxy, ProxyRemoval::Keep),
+                            "closed before draining: {pause}"
+                        );
+                        assert_eq!(mem.read_obj::<u16>(GuestAddress(USED + 2)).unwrap(), 1);
+                        if pause == "credit" {
+                            assert!(matches!(
+                                update.push_credit_req,
+                                Some(MuxerRx::CreditRequest { .. })
+                            ));
+                            let credit_mem =
+                                GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)])
+                                    .unwrap();
+                            let mut credit = tx_packet(&credit_mem, 0, &[]);
+                            credit.set_buf_alloc(CHUNK as u32).set_fwd_cnt(CHUNK as u32);
+                            proxy.update_peer_credit(&credit);
+                        } else {
+                            let mut ready = vec![EpollEvent::new(EventSet::empty(), 0); 2];
+                            assert_eq!(
+                                epoll.wait(2, 0, &mut ready).unwrap(),
+                                0,
+                                "socket must not remain ready while guest RX buffers are exhausted"
+                            );
+                            // A kick for another connection must not leave this
+                            // socket spinning if its RX queue is still empty.
+                            proxy.kick();
+                            assert_eq!(epoll.wait(2, 1000, &mut ready).unwrap(), 1);
+                            proxy.process_event(ready[0].event_set());
+                            assert_eq!(epoll.wait(2, 0, &mut ready).unwrap(), 0);
+
+                            mem.write_obj(3u16, GuestAddress(AVAIL + 2)).unwrap();
+                            proxy.kick();
+                            assert_eq!(
+                                epoll.wait(2, 1000, &mut ready).unwrap(),
+                                1,
+                                "new guest RX buffers must wake the paused proxy"
+                            );
+                        }
+                        update = proxy.process_event(EventSet::IN);
+                        // At an exact credit boundary the EOF read needs fresh credit too.
+                        if pause == "credit" {
+                            let credit_mem =
+                                GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)])
+                                    .unwrap();
+                            let mut credit = tx_packet(&credit_mem, 0, &[]);
+                            credit
+                                .set_buf_alloc(CHUNK as u32)
+                                .set_fwd_cnt((CHUNK * 2) as u32);
+                            proxy.update_peer_credit(&credit);
+                            update = proxy.process_event(event);
+                        }
+                    }
+
+                    assert_eq!(
+                        mem.read_obj::<u16>(GuestAddress(USED + 2)).unwrap(),
+                        3,
+                        "expected two data packets followed by reset"
+                    );
+                    assert!(matches!(update.remove_proxy, ProxyRemoval::Immediate));
+                    assert!(update.signal_queue);
+                    let mut received = Vec::new();
+                    for i in 0..3u16 {
+                        let head =
+                            DescriptorChain::checked_new(&mem, GuestAddress(DESC), 8, i).unwrap();
+                        let pkt = VsockPacket::from_rx_virtq_head(&head).unwrap();
+                        if i < 2 {
+                            assert_eq!(pkt.op(), uapi::VSOCK_OP_RW);
+                            received.extend_from_slice(pkt.payload().unwrap());
+                        } else {
+                            assert_eq!(pkt.op(), uapi::VSOCK_OP_RST);
+                        }
+                    }
+                    assert_eq!(received, payload);
+                    proxy.kick();
+                    let mut ready = vec![EpollEvent::new(EventSet::empty(), 0); 2];
+                    assert_eq!(
+                        epoll.wait(2, 0, &mut ready).unwrap(),
+                        0,
+                        "closed proxies must unregister the socket and notifier"
+                    );
+                }
+            }
+        }
     }
 }
