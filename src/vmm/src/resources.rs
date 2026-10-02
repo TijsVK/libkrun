@@ -325,6 +325,9 @@ pub struct VmResources {
     /// The fs device.
     #[cfg(not(feature = "tee"))]
     pub fs: Vec<FsDeviceConfig>,
+    /// Limits shared by device capture, restore, and standalone state codecs.
+    #[cfg(not(feature = "tee"))]
+    pub device_state_limits: devices::virtio::DeviceStateLimits,
     /// Custom filesystem devices.
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     pub custom_fs: Vec<CustomFsDeviceConfig>,
@@ -422,6 +425,8 @@ impl Default for VmResources {
             initrd_bundle: None,
             #[cfg(not(feature = "tee"))]
             fs: Vec::new(),
+            #[cfg(not(feature = "tee"))]
+            device_state_limits: devices::virtio::DeviceStateLimits::default(),
             #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
             custom_fs: Vec::new(),
             vsock: VsockBuilder::default(),

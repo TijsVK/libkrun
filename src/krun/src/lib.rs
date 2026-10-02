@@ -231,12 +231,18 @@ pub use api::vm::{
     VmGenerationState, VmGenerationWaitOutcome, VmMemoryRestoreSource, VmMemoryRestoreTarget,
     VmMemoryState, VmPauseGeneration,
 };
+#[cfg(all(feature = "blk", not(feature = "tee")))]
+pub use api::{
+    max_virtio_device_state_bytes, BlockDeviceState, DeviceStateCodec, VirtioDeviceState,
+};
 #[cfg(feature = "blk")]
 pub use api::{
     BlockBackendSpec, BlockImageFormat, BlockLayerSpec, BlockSyncMode, PreparedBlockBackend,
 };
-#[cfg(all(feature = "blk", not(feature = "tee")))]
-pub use api::{BlockDeviceState, VirtioDeviceState};
+#[cfg(not(feature = "tee"))]
+pub use api::{
+    DeviceStateLimits, DEFAULT_MAX_FS_BACKEND_STATE_BYTES, FS_DEVICE_STATE_HEADER_BYTES,
+};
 #[cfg(not(feature = "tee"))]
 pub use api::{
     ExecutionArchitecture, ExecutionBackend, ExecutionState, FullCaptureReason, GuestMemoryRange,
