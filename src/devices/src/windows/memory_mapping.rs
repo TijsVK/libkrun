@@ -15,7 +15,8 @@ use windows_sys::Win32::System::Ioctl::{
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, DiscardVirtualMemory, FlushViewOfFile, MapViewOfFile, UnmapViewOfFile,
-    FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READONLY, PAGE_READWRITE,
+    VirtualAlloc, VirtualFree, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS,
+    MEM_COMMIT, MEM_DECOMMIT, PAGE_READONLY, PAGE_READWRITE,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -260,6 +261,46 @@ pub(crate) unsafe fn discard_virtual_memory_range(addr: *mut c_void, len: usize)
     }
 }
 
+/// Outcome of [`zero_private_range`] when it could not complete.
+#[derive(Debug)]
+pub(crate) enum ZeroPrivateRangeError {
+    /// `VirtualFree(MEM_DECOMMIT)` refused the range (for example a mapped view). Nothing changed;
+    /// the caller may fall back to explicit zero writes.
+    Decommit(io::Error),
+    /// The range was decommitted but could not be committed again. It is reserved, inaccessible
+    /// memory until a later commit succeeds, so the caller must not write to it.
+    Recommit(io::Error),
+}
+
+/// Replace committed private pages with demand-zero pages at the same address.
+///
+/// Windows has no discard call that promises zero on the next read, but newly committed private
+/// pages always read as zero. Decommitting releases the physical pages and their pagefile backing;
+/// recommitting the still-reserved range charges commit again without touching any page. The
+/// virtual address never changes, so worker pointers and hypervisor mappings that refer to it stay
+/// valid. Only memory allocated with `VirtualAlloc` can be decommitted.
+///
+/// # Safety
+///
+/// `addr..addr + len` must be page-aligned, lie inside one `VirtualAlloc` allocation, and must not
+/// be accessed by any other thread until this returns.
+pub(crate) unsafe fn zero_private_range(
+    addr: *mut c_void,
+    len: usize,
+) -> Result<(), ZeroPrivateRangeError> {
+    if len == 0 {
+        return Ok(());
+    }
+
+    if VirtualFree(addr, len, MEM_DECOMMIT) == 0 {
+        return Err(ZeroPrivateRangeError::Decommit(io::Error::last_os_error()));
+    }
+    if VirtualAlloc(addr, len, MEM_COMMIT, PAGE_READWRITE).is_null() {
+        return Err(ZeroPrivateRangeError::Recommit(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 pub(crate) fn is_unsupported_discard_error(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),
@@ -453,6 +494,50 @@ mod tests {
 
         drop(file);
         remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn zero_private_range_zeroes_in_place_and_stays_writable() {
+        const LEN: usize = 2 << 20;
+        let base = unsafe {
+            VirtualAlloc(
+                ptr::null(),
+                LEN,
+                MEM_COMMIT | windows_sys::Win32::System::Memory::MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!base.is_null());
+        let bytes = base.cast::<u8>();
+        unsafe {
+            ptr::write_bytes(bytes, 0xa5, LEN);
+            // Zero only the second half; the first half must keep its data.
+            zero_private_range(bytes.add(LEN / 2).cast(), LEN / 2).unwrap();
+            let all = std::slice::from_raw_parts_mut(bytes, LEN);
+            assert!(all[..LEN / 2].iter().all(|byte| *byte == 0xa5));
+            assert!(all[LEN / 2..].iter().all(|byte| *byte == 0));
+            all[LEN - 1] = 0x5a;
+            assert_eq!(all[LEN - 1], 0x5a);
+            assert_ne!(
+                VirtualFree(base, 0, windows_sys::Win32::System::Memory::MEM_RELEASE),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn zero_private_range_refuses_mapped_views_without_changing_them() {
+        let mut view =
+            WindowsFileMappingView::map_anonymous(1 << 16, WindowsFileMappingAccess::ReadWrite)
+                .unwrap();
+        view.copy_from_slice(&[0xa5; 4096]).unwrap();
+
+        let result = unsafe { zero_private_range(view.host_ptr().cast(), 4096) };
+
+        assert!(matches!(result, Err(ZeroPrivateRangeError::Decommit(_))));
+        unsafe {
+            assert!(view.as_slice()[..4096].iter().all(|byte| *byte == 0xa5));
+        }
     }
 
     fn create_temp_file(path: &PathBuf, len: usize) -> File {

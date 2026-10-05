@@ -2,7 +2,7 @@ use std::cmp;
 use std::io::{self, Write};
 
 use utils::eventfd::EventFd;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use vm_memory::{Address, GuestMemoryRegion};
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
@@ -462,9 +462,11 @@ fn zero_guest_range(memory: &GuestMemoryMmap, start: u64, length: u64) -> io::Re
     }
 
     // Linux promises demand-zero refault only for private anonymous DONTNEED mappings. Private
-    // file mappings refault their old file bytes; Darwin/Windows discard APIs do not promise zero.
-    // Fall back to bounded writes there, or if Linux refuses the optimization, without remapping
-    // memory beneath registered hypervisor slots and existing worker pointers.
+    // file mappings refault their old file bytes; Darwin discard APIs do not promise zero. On
+    // Windows, decommitting and recommitting `VirtualAlloc` memory in place gives demand-zero pages
+    // without writing them. Fall back to bounded writes elsewhere, or if the host refuses the
+    // optimization, without remapping memory beneath registered hypervisor slots and existing
+    // worker pointers.
     #[cfg(target_os = "linux")]
     if let Some(region) = memory.find_region(GuestAddress(start)) {
         if region.file_offset().is_none()
@@ -477,6 +479,29 @@ fn zero_guest_range(memory: &GuestMemoryMmap, start: u64, length: u64) -> io::Re
                 .map_err(io::Error::other)?;
             if unsafe { libc::madvise(host.cast(), len, libc::MADV_DONTNEED) } == 0 {
                 return Ok(());
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(region) = memory.find_region(GuestAddress(start)) {
+        if region.file_offset().is_none() && region.last_addr().raw_value() >= start + length - 1 {
+            use crate::windows::memory_mapping::{zero_private_range, ZeroPrivateRangeError};
+
+            let host = memory
+                .get_host_address(GuestAddress(start))
+                .map_err(io::Error::other)?;
+            match unsafe { zero_private_range(host.cast(), len) } {
+                Ok(()) => return Ok(()),
+                Err(ZeroPrivateRangeError::Decommit(error)) => {
+                    debug!("virtio-mem: decommit refused, zeroing by writes: {error}");
+                }
+                Err(ZeroPrivateRangeError::Recommit(error)) => {
+                    // The range is reserved but not committed. Writing to it would fault, and the
+                    // unplug is not acknowledged, so report the failure instead.
+                    return Err(io::Error::other(format!(
+                        "virtio-mem: cannot recommit zeroed range: {error}"
+                    )));
+                }
             }
         }
     }
