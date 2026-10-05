@@ -319,10 +319,22 @@ impl CustomStreamProxy {
         Ok(total_written)
     }
 
+    /// Consumed bytes after which the guest gets a standalone credit update.
+    ///
+    /// Linux caps a sender's window at its own `buf_alloc` as well as ours
+    /// ("vsock/virtio: cap TX credit to local buffer size", 6.19 and stable
+    /// 6.1.162, 6.6.122, 6.12.68, 6.18.8). With the default 256 KiB socket
+    /// buffer a guest never has `CONN_TX_BUF_SIZE / 2` in flight, so half of
+    /// the smaller window is the most it can wait for.
+    fn credit_update_threshold(&self) -> usize {
+        (self.peer_buf_alloc as usize).min(defs::CONN_TX_BUF_SIZE) / 2
+    }
+
     /// Return stream credit only after the host backend has consumed bytes
     /// from the bounded proxy queue.
     fn maybe_push_credit_update(&mut self, update: &mut ProxyUpdate) {
-        if ((self.tx_cnt - self.last_tx_cnt_sent).0 as usize) < defs::CONN_TX_BUF_SIZE / 2 {
+        let consumed = (self.tx_cnt - self.last_tx_cnt_sent).0 as usize;
+        if consumed == 0 || consumed < self.credit_update_threshold() {
             return;
         }
 
@@ -711,6 +723,53 @@ mod tests {
         assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
         assert_eq!(&*state.written.lock().unwrap(), b"a");
         assert_eq!(proxy.tx_cnt.0, 1);
+    }
+
+    /// A one-way upload from a guest with the default 256 KiB socket buffer
+    /// must get credit back before that buffer is full; nothing else on the
+    /// connection returns it.
+    #[test]
+    fn returns_credit_within_a_small_guest_window() {
+        const GUEST_BUF: usize = 256 * 1024;
+        const CHUNK: usize = 4096;
+
+        let state = Arc::new(TestStreamState {
+            blocked: AtomicBool::new(false),
+            written: Mutex::new(Vec::new()),
+        });
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let pkt = tx_packet(&mem, CHUNK as u32, &[b'x'; CHUNK]);
+        let mut proxy = test_proxy(Arc::clone(&state), mem.clone());
+        proxy.peer_buf_alloc = GUEST_BUF as u32;
+
+        for _ in 0..GUEST_BUF / CHUNK {
+            let update = proxy.sendmsg(&pkt);
+            assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+            if let Some(MuxerRx::CreditUpdate { fwd_cnt, .. }) = proxy.rxq.lock().unwrap().pop() {
+                assert!(update.signal_queue);
+                assert_eq!(fwd_cnt as usize, GUEST_BUF / 2);
+                assert_eq!(fwd_cnt as usize, state.written.lock().unwrap().len());
+                return;
+            }
+        }
+        panic!("no credit update within a {GUEST_BUF}-byte guest window");
+    }
+
+    /// A guest that raises its buffer beyond ours is still bounded by
+    /// `CONN_TX_BUF_SIZE`, so the threshold must not grow past half of it.
+    #[test]
+    fn caps_the_credit_threshold_at_the_host_window() {
+        let state = Arc::new(TestStreamState {
+            blocked: AtomicBool::new(false),
+            written: Mutex::new(Vec::new()),
+        });
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = test_proxy(state, mem);
+
+        proxy.peer_buf_alloc = 256 * 1024;
+        assert_eq!(proxy.credit_update_threshold(), 128 * 1024);
+        proxy.peer_buf_alloc = u32::MAX;
+        assert_eq!(proxy.credit_update_threshold(), defs::CONN_TX_BUF_SIZE / 2);
     }
 
     #[test]
