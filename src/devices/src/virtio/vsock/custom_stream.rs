@@ -43,6 +43,9 @@ pub struct CustomStreamProxy {
     last_tx_cnt_sent: Wrapping<u32>,
     rx_cnt: Wrapping<u32>,
     pending_write: VecDeque<u8>,
+    /// A guest shutdown that arrived while `pending_write` still held its
+    /// bytes. It reaches the backend once they are written.
+    pending_shutdown: Option<VsockShutdown>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -87,6 +90,7 @@ impl CustomStreamProxy {
             last_tx_cnt_sent: Wrapping(0),
             rx_cnt: Wrapping(0),
             pending_write: VecDeque::new(),
+            pending_shutdown: None,
         })
     }
 
@@ -330,6 +334,21 @@ impl CustomStreamProxy {
         (self.peer_buf_alloc as usize).min(defs::CONN_TX_BUF_SIZE) / 2
     }
 
+    /// Forward a deferred guest shutdown once every accepted byte has reached
+    /// the backend. Shutting the backend down earlier drops the queued tail:
+    /// later writes fail and a backend read reports EOF, which resets the
+    /// stream.
+    fn apply_pending_shutdown(&mut self) {
+        if !self.pending_write.is_empty() {
+            return;
+        }
+        if let Some(how) = self.pending_shutdown.take() {
+            if let Err(err) = self.backend.shutdown(how) {
+                warn!("error shutting down custom vsock backend: {err}");
+            }
+        }
+    }
+
     /// Return stream credit only after the host backend has consumed bytes
     /// from the bounded proxy queue.
     fn maybe_push_credit_update(&mut self, update: &mut ProxyUpdate) {
@@ -499,9 +518,13 @@ impl Proxy for CustomStreamProxy {
             (true, false) => VsockShutdown::Read,
             (false, _) => VsockShutdown::Write,
         };
-        if let Err(err) = self.backend.shutdown(how) {
-            warn!("error shutting down custom vsock backend: {err}");
-        }
+        // The guest sends SHUTDOWN after its last data packet, but the backend
+        // may not have taken all of that data yet. Keep the order: data first.
+        self.pending_shutdown = Some(match self.pending_shutdown {
+            Some(earlier) if earlier != how => VsockShutdown::Both,
+            _ => how,
+        });
+        self.apply_pending_shutdown();
     }
 
     fn release(&mut self) -> ProxyUpdate {
@@ -543,6 +566,7 @@ impl Proxy for CustomStreamProxy {
                 return update;
             }
             self.maybe_push_credit_update(&mut update);
+            self.apply_pending_shutdown();
         }
 
         // A hang-up can arrive with unread host bytes (including macOS EV_EOF).
@@ -605,6 +629,8 @@ mod tests {
     struct TestStreamState {
         blocked: AtomicBool,
         written: Mutex<Vec<u8>>,
+        /// Each backend shutdown, with how many bytes had been written by then.
+        shutdowns: Mutex<Vec<(VsockShutdown, usize)>>,
     }
 
     struct TestStream {
@@ -630,7 +656,9 @@ mod tests {
             Ok(count)
         }
 
-        fn shutdown(&self, _how: VsockShutdown) -> io::Result<()> {
+        fn shutdown(&self, how: VsockShutdown) -> io::Result<()> {
+            let written = self.state.written.lock().unwrap().len();
+            self.state.shutdowns.lock().unwrap().push((how, written));
             Ok(())
         }
     }
@@ -691,6 +719,7 @@ mod tests {
         let state = Arc::new(TestStreamState {
             blocked: AtomicBool::new(true),
             written: Mutex::new(Vec::new()),
+            shutdowns: Mutex::new(Vec::new()),
         });
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let mut proxy = test_proxy(Arc::clone(&state), mem);
@@ -709,10 +738,57 @@ mod tests {
     }
 
     #[test]
+    fn guest_shutdown_waits_for_buffered_bytes() {
+        let state = Arc::new(TestStreamState {
+            blocked: AtomicBool::new(true),
+            written: Mutex::new(Vec::new()),
+            shutdowns: Mutex::new(Vec::new()),
+        });
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut shutdown = tx_packet(&mem, 0, b"");
+        shutdown.set_flags(uapi::VSOCK_FLAGS_SHUTDOWN_RCV | uapi::VSOCK_FLAGS_SHUTDOWN_SEND);
+        let mut proxy = test_proxy(Arc::clone(&state), mem);
+
+        // The guest wrote "hello" and closed; the backend has taken two bytes.
+        proxy.pending_write.extend(b"hello");
+        proxy.flush_pending_write().unwrap();
+        proxy.shutdown(&shutdown);
+        assert!(state.shutdowns.lock().unwrap().is_empty());
+
+        state.blocked.store(false, Ordering::Relaxed);
+        proxy.process_event(EventSet::IN);
+        assert_eq!(&*state.written.lock().unwrap(), b"hello");
+        assert_eq!(
+            *state.shutdowns.lock().unwrap(),
+            vec![(VsockShutdown::Both, 5)]
+        );
+    }
+
+    #[test]
+    fn guest_shutdown_with_nothing_buffered_is_immediate() {
+        let state = Arc::new(TestStreamState {
+            blocked: AtomicBool::new(false),
+            written: Mutex::new(Vec::new()),
+            shutdowns: Mutex::new(Vec::new()),
+        });
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut shutdown = tx_packet(&mem, 0, b"");
+        shutdown.set_flags(uapi::VSOCK_FLAGS_SHUTDOWN_SEND);
+        let mut proxy = test_proxy(Arc::clone(&state), mem);
+
+        proxy.shutdown(&shutdown);
+        assert_eq!(
+            *state.shutdowns.lock().unwrap(),
+            vec![(VsockShutdown::Write, 0)]
+        );
+    }
+
+    #[test]
     fn forwards_only_the_declared_packet_payload() {
         let state = Arc::new(TestStreamState {
             blocked: AtomicBool::new(false),
             written: Mutex::new(Vec::new()),
+            shutdowns: Mutex::new(Vec::new()),
         });
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let pkt = tx_packet(&mem, 1, b"a-secret-tail");
@@ -736,6 +812,7 @@ mod tests {
         let state = Arc::new(TestStreamState {
             blocked: AtomicBool::new(false),
             written: Mutex::new(Vec::new()),
+            shutdowns: Mutex::new(Vec::new()),
         });
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let pkt = tx_packet(&mem, CHUNK as u32, &[b'x'; CHUNK]);
@@ -762,6 +839,7 @@ mod tests {
         let state = Arc::new(TestStreamState {
             blocked: AtomicBool::new(false),
             written: Mutex::new(Vec::new()),
+            shutdowns: Mutex::new(Vec::new()),
         });
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let mut proxy = test_proxy(state, mem);
@@ -778,6 +856,7 @@ mod tests {
             blocked: AtomicBool::new(true),
             // The test backend returns WouldBlock after accepting two bytes.
             written: Mutex::new(vec![0, 0]),
+            shutdowns: Mutex::new(Vec::new()),
         });
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let pkt = tx_packet(&mem, 1, b"x");
