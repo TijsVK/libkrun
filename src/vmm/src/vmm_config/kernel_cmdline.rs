@@ -9,12 +9,18 @@ use std::fmt::{Display, Formatter, Result};
 
 // The matching x86 guest kernel uses this opt-in to select libkrun's existing i8042 exit
 // transport for poweroff. Hypervisor CPUID alone would also match unrelated virtual machines.
-#[cfg(all(
-    target_arch = "x86_64",
-    any(target_os = "linux", target_os = "macos", target_os = "windows")
-))]
+#[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "macos")))]
 pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
                                           rootfstype=virtiofs rw quiet no-kvmapf krun.poweroff=i8042";
+// On WHP the guest identifies no hypervisor that sets `no_timer_check` for it (Linux does so for
+// KVM, Hyper-V and VMware), so it runs the IO-APIC `check_timer()` probe. That probe wants more than
+// four PIT ticks within a short TSC-timed window, but the PIT ticks from a host thread and ticks
+// that land while the host is busy are lost; the probe then panics ("IO-APIC + timer doesn't
+// work!") and `panic=-1` turns it into an immediate, silent VM exit before the console is up.
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
+                                          rootfstype=virtiofs rw quiet no-kvmapf krun.poweroff=i8042 \
+                                          no_timer_check";
 #[cfg(all(
     not(target_arch = "x86_64"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
@@ -74,7 +80,7 @@ mod tests {
     fn default_poweroff_opt_in_preserves_existing_boot_options() {
         let boot_options = DEFAULT_KERNEL_CMDLINE
             .split_whitespace()
-            .filter(|option| !option.starts_with("krun.poweroff="))
+            .filter(|option| !option.starts_with("krun.poweroff=") && *option != "no_timer_check")
             .collect::<Vec<_>>()
             .join(" ");
 
@@ -82,6 +88,18 @@ mod tests {
             boot_options,
             "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
              rootfstype=virtiofs rw quiet no-kvmapf"
+        );
+    }
+
+    #[test]
+    fn default_skips_the_boot_timer_check_only_on_windows_x86_64() {
+        let skips = DEFAULT_KERNEL_CMDLINE
+            .split_whitespace()
+            .any(|option| option == "no_timer_check");
+
+        assert_eq!(
+            skips,
+            cfg!(all(target_arch = "x86_64", target_os = "windows"))
         );
     }
 }
