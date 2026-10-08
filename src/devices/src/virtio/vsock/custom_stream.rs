@@ -46,6 +46,10 @@ pub struct CustomStreamProxy {
     /// A guest shutdown that arrived while `pending_write` still held its
     /// bytes. It reaches the backend once they are written.
     pending_shutdown: Option<VsockShutdown>,
+    /// The guest reset the stream after shutting down its send side, while
+    /// `pending_write` still held bytes it had been given credit for. Only the
+    /// host side is left: write those bytes, then shut the backend down.
+    guest_closed: bool,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -91,6 +95,7 @@ impl CustomStreamProxy {
             rx_cnt: Wrapping(0),
             pending_write: VecDeque::new(),
             pending_shutdown: None,
+            guest_closed: false,
         })
     }
 
@@ -117,7 +122,11 @@ impl CustomStreamProxy {
     }
 
     fn connected_poll_events(&self) -> EventSet {
-        if self.uses_notifier() || self.pending_write.is_empty() {
+        if self.guest_closed && !self.uses_notifier() {
+            // Nothing is read for a guest that is gone; a level-triggered IN
+            // would only spin.
+            EventSet::OUT
+        } else if self.uses_notifier() || self.pending_write.is_empty() {
             EventSet::IN
         } else {
             EventSet::IN | EventSet::OUT
@@ -349,6 +358,26 @@ impl CustomStreamProxy {
         }
     }
 
+    /// Write what a closed guest left in `pending_write`, then shut the backend
+    /// down and remove the proxy. Nothing goes to the guest any more.
+    fn drain_for_closed_guest(&mut self) -> ProxyUpdate {
+        let mut update = ProxyUpdate::default();
+        if let Err(err) = self.flush_pending_write() {
+            warn!(
+                "custom vsock backend write failed after the guest closed, {} bytes dropped: {err}",
+                self.pending_write.len()
+            );
+            self.pending_write.clear();
+        }
+        if self.pending_write.is_empty() {
+            self.apply_pending_shutdown();
+            self.status = ProxyStatus::Closed;
+            update.remove_proxy = ProxyRemoval::Immediate;
+        }
+        self.update_polling();
+        update
+    }
+
     /// Return stream credit only after the host backend has consumed bytes
     /// from the bounded proxy queue.
     fn maybe_push_credit_update(&mut self, update: &mut ProxyUpdate) {
@@ -417,6 +446,15 @@ impl Proxy for CustomStreamProxy {
     }
 
     fn confirm_connect(&mut self, pkt: &VsockPacket) -> Option<ProxyUpdate> {
+        if self.guest_closed {
+            // A new guest connection on the ports of one that is still being
+            // drained: refuse it rather than mix two streams in one backend.
+            self.push_reset();
+            return Some(ProxyUpdate {
+                signal_queue: true,
+                ..Default::default()
+            });
+        }
         self.prepare_connect(pkt);
         // A duplicate request can arrive while an asynchronous host connect is
         // still pending. Do not acknowledge it until connect_state reports the
@@ -528,6 +566,27 @@ impl Proxy for CustomStreamProxy {
     }
 
     fn release(&mut self) -> ProxyUpdate {
+        // After a shutdown of its send side the guest resets the stream when
+        // its own close timer runs out (8 s in Linux), not to abort it. The
+        // bytes in pending_write were already credited to it, as if they were
+        // in the host's receive buffer, which a reset does not empty either.
+        // Keep writing them; the host side ends the drain by reading them or by
+        // closing its end.
+        if !self.pending_write.is_empty()
+            && matches!(
+                self.pending_shutdown,
+                Some(VsockShutdown::Write | VsockShutdown::Both)
+            )
+            && matches!(
+                self.status,
+                ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+            )
+        {
+            self.guest_closed = true;
+            self.status = ProxyStatus::Connected;
+            self.update_polling();
+            return ProxyUpdate::default();
+        }
         self.status = ProxyStatus::Closed;
         self.update_polling();
         ProxyUpdate {
@@ -558,6 +617,10 @@ impl Proxy for CustomStreamProxy {
             }
         } else if evset.contains(EventSet::IN) {
             self.clear_notification();
+        }
+
+        if self.guest_closed {
+            return self.drain_for_closed_guest();
         }
 
         if self.status == ProxyStatus::Connected && !self.pending_write.is_empty() {
@@ -781,6 +844,81 @@ mod tests {
             *state.shutdowns.lock().unwrap(),
             vec![(VsockShutdown::Write, 0)]
         );
+    }
+
+    fn blocked_proxy_holding_hello(
+        state: &Arc<TestStreamState>,
+    ) -> (CustomStreamProxy, VsockPacket) {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut close = tx_packet(&mem, 0, b"");
+        close.set_flags(uapi::VSOCK_FLAGS_SHUTDOWN_RCV | uapi::VSOCK_FLAGS_SHUTDOWN_SEND);
+        let mut proxy = test_proxy(Arc::clone(state), mem);
+        // The guest wrote "hello"; the backend has taken two bytes.
+        proxy.pending_write.extend(b"hello");
+        proxy.flush_pending_write().unwrap();
+        (proxy, close)
+    }
+
+    #[test]
+    fn guest_reset_after_close_keeps_writing_buffered_bytes() {
+        let state = Arc::new(TestStreamState {
+            blocked: AtomicBool::new(true),
+            written: Mutex::new(Vec::new()),
+            shutdowns: Mutex::new(Vec::new()),
+        });
+        let (mut proxy, close) = blocked_proxy_holding_hello(&state);
+
+        // The guest closes, and its close timer resets the stream before the
+        // host has read the rest.
+        proxy.shutdown(&close);
+        let update = proxy.release();
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+        let update = proxy.process_event(EventSet::OUT);
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+        assert_eq!(&*state.written.lock().unwrap(), b"he");
+
+        state.blocked.store(false, Ordering::Relaxed);
+        let update = proxy.process_event(EventSet::OUT);
+        assert_eq!(&*state.written.lock().unwrap(), b"hello");
+        assert_eq!(
+            *state.shutdowns.lock().unwrap(),
+            vec![(VsockShutdown::Both, 5)]
+        );
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Immediate));
+    }
+
+    #[test]
+    fn guest_reset_without_a_close_drops_buffered_bytes() {
+        let state = Arc::new(TestStreamState {
+            blocked: AtomicBool::new(true),
+            written: Mutex::new(Vec::new()),
+            shutdowns: Mutex::new(Vec::new()),
+        });
+        let (mut proxy, _) = blocked_proxy_holding_hello(&state);
+
+        // A reset with no shutdown before it is an abort.
+        let update = proxy.release();
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Immediate));
+        assert!(state.shutdowns.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn new_request_on_a_draining_stream_is_refused() {
+        let state = Arc::new(TestStreamState {
+            blocked: AtomicBool::new(true),
+            written: Mutex::new(Vec::new()),
+            shutdowns: Mutex::new(Vec::new()),
+        });
+        let (mut proxy, close) = blocked_proxy_holding_hello(&state);
+        proxy.shutdown(&close);
+        proxy.release();
+
+        // The same guest port connects again while the old bytes drain.
+        let update = proxy.confirm_connect(&close);
+        assert!(update.is_some_and(|update| update.signal_queue));
+        state.blocked.store(false, Ordering::Relaxed);
+        proxy.process_event(EventSet::OUT);
+        assert_eq!(&*state.written.lock().unwrap(), b"hello");
     }
 
     #[test]
