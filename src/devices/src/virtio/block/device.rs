@@ -420,12 +420,6 @@ impl DiskProperties {
     }
 
     pub(crate) fn discard_to_any(&self, offset: u64, length: u64) -> io::Result<()> {
-        if self.has_writeback_limit() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "discard is disabled by the bounded writeback policy",
-            ));
-        }
         self.validate_mutation_range(offset, length)?;
 
         #[cfg(windows)]
@@ -433,8 +427,14 @@ impl DiskProperties {
             return raw_file.discard_to_any(offset, length);
         }
 
-        let mut diskfile = self.file.lock().unwrap();
-        diskfile.discard_to_any(offset, length)
+        // Under bounded writeback every chunk of the range is charged to the budget like a write
+        // of the same span: a hole punch dirties filesystem metadata that `sync_file_range()`
+        // cannot see, so the charge (retired by a sync of the span, which is cheap for a hole)
+        // paces how fast a guest can create holes. Without a budget this is a single call.
+        self.run_buffered_mutation(offset, length, None, |chunk_offset, chunk_length| {
+            let mut diskfile = self.file.lock().unwrap();
+            diskfile.discard_to_any(chunk_offset, chunk_length)
+        })
     }
 
     pub(crate) fn discard_to_zero(&self, offset: u64, length: u64) -> io::Result<()> {
@@ -1005,12 +1005,11 @@ impl Block {
             | (1u64 << VIRTIO_BLK_F_WRITE_ZEROES)
             | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
-        // DISCARD and WRITE_ZEROES|UNMAP can create metadata-only holes that are invisible to
-        // sync_file_range() accounting. Keep ordinary WRITE_ZEROES, but force it through explicit
-        // zero-data writes while the hard writeback budget is active.
-        if !bounded_writeback_enabled {
-            avail_features |= 1u64 << VIRTIO_BLK_F_DISCARD;
-        }
+        // DISCARD stays available under the writeback budget: a guest `fstrim` is how freed space
+        // returns to the host, and each discard is charged to the budget (`discard_to_any`).
+        // WRITE_ZEROES|UNMAP creates the same holes but is a hint the guest does not need, so it
+        // is forced through explicit zero-data writes while the hard writeback budget is active.
+        avail_features |= 1u64 << VIRTIO_BLK_F_DISCARD;
 
         if sync_mode != SyncMode::None {
             avail_features |= 1u64 << VIRTIO_BLK_F_FLUSH;
@@ -1025,17 +1024,9 @@ impl Block {
             size_max: 0,
             // QUEUE_SIZE - 2
             seg_max: 254,
-            max_discard_sectors: if bounded_writeback_enabled {
-                0
-            } else {
-                u32::MAX
-            },
-            max_discard_seg: u32::from(!bounded_writeback_enabled),
-            discard_sector_alignment: if bounded_writeback_enabled {
-                0
-            } else {
-                discard_alignment as u32 / 512
-            },
+            max_discard_sectors: u32::MAX,
+            max_discard_seg: 1,
+            discard_sector_alignment: discard_alignment as u32 / 512,
             max_write_zeroes_sectors: u32::MAX,
             max_write_zeroes_seg: 1,
             write_zeroes_may_unmap: u8::from(!bounded_writeback_enabled),
@@ -1146,8 +1137,8 @@ impl Block {
         disk.set_windows_raw_file(backend.windows_raw_file.clone());
         #[cfg(target_os = "linux")]
         if leaving_bounded_writeback {
-            // Guest-visible discard/unmap remains conservatively disabled, but the new direct-I/O
-            // backend bypasses the host page cache and no longer needs raw-offset accounting.
+            // The new direct-I/O backend bypasses the host page cache and no longer needs
+            // raw-offset accounting; unmapping zero writes stay explicit zero writes.
             self.writeback_config = None;
         }
         self.disk_image = backend.disk_image;
@@ -1695,7 +1686,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bounded_writeback_advertises_only_accountable_zeroing() {
+    fn bounded_writeback_advertises_discard_and_only_accountable_zeroing() {
         let backing = TempFile::new().unwrap();
         backing.as_file().set_len(4 * 1024 * 1024).unwrap();
         let block = Block::new_with_writeback_limit(
@@ -1712,7 +1703,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(block.avail_features & (1u64 << VIRTIO_BLK_F_DISCARD), 0);
+        assert_ne!(block.avail_features & (1u64 << VIRTIO_BLK_F_DISCARD), 0);
         assert_ne!(
             block.avail_features & (1u64 << VIRTIO_BLK_F_WRITE_ZEROES),
             0
@@ -1721,9 +1712,8 @@ mod tests {
         let max_discard_seg = block.config.max_discard_seg;
         let discard_sector_alignment = block.config.discard_sector_alignment;
         let write_zeroes_may_unmap = block.config.write_zeroes_may_unmap;
-        assert_eq!(max_discard_sectors, 0);
-        assert_eq!(max_discard_seg, 0);
-        assert_eq!(discard_sector_alignment, 0);
+        assert_eq!(max_discard_sectors, u32::MAX);
+        assert_eq!(max_discard_seg, 1);
         assert_eq!(write_zeroes_may_unmap, 0);
 
         let legacy = Block::new(
@@ -1738,6 +1728,8 @@ mod tests {
             MetricsWriter::default().register_block_device("legacy".to_string()),
         )
         .unwrap();
+        let legacy_alignment = legacy.config.discard_sector_alignment;
+        assert_eq!(discard_sector_alignment, legacy_alignment);
         let legacy_may_unmap = legacy.config.write_zeroes_may_unmap;
         assert_ne!(legacy.avail_features & (1u64 << VIRTIO_BLK_F_DISCARD), 0);
         assert_eq!(legacy_may_unmap, 1);
@@ -1856,7 +1848,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bounded_worker_accepts_unmap_zeroes_without_discarding() {
+    fn bounded_worker_keeps_unmap_zeroes_as_zero_writes() {
         use std::os::unix::fs::{FileExt, MetadataExt};
 
         use vm_memory::{Bytes, GuestAddress};
@@ -1958,10 +1950,6 @@ mod tests {
             ),
             Err(RequestError::InvalidMutationRange(_))
         ));
-        assert!(matches!(
-            request(VIRTIO_BLK_T_DISCARD, 0, 8, 0),
-            Err(RequestError::UnsupportedMutation)
-        ));
         request(VIRTIO_BLK_T_FLUSH, 0, 0, 0).unwrap();
         drop(worker);
         let bytes = std::fs::read(backing.as_path()).unwrap();
@@ -1972,6 +1960,112 @@ mod tests {
             backing.as_file().metadata().unwrap().blocks() >= allocated,
             "bounded zero writes must not punch holes"
         );
+    }
+
+    /// A guest discard under the bounded writeback policy reaches the image as a hole punch
+    /// (this is what lets `fstrim` return space to the host), including a range larger than the
+    /// whole writeback budget, which is admitted in budget-sized charges.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_worker_punches_holes_for_discard() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        use vm_memory::{Bytes, GuestAddress};
+
+        use super::super::worker::{RequestError, RequestHeader};
+        use crate::legacy::DummyIrqChip;
+        use crate::virtio::descriptor_utils::{
+            create_descriptor_chain, DescriptorType, Reader, Writer,
+        };
+
+        // 1 GiB image (sparse except for the head), larger than the minimum budget several times.
+        let backing = TempFile::new().unwrap();
+        let length: u64 = 1024 * 1024 * 1024;
+        backing.as_file().set_len(length).unwrap();
+        let head = 4 * 1024 * 1024;
+        backing
+            .as_file()
+            .write_all_at(&vec![0x5a; head], 0)
+            .unwrap();
+        backing.as_file().sync_all().unwrap();
+        let allocated = backing.as_file().metadata().unwrap().blocks();
+        let mut block = Block::new_with_writeback_limit(
+            "discard".into(),
+            None,
+            CacheType::Writeback,
+            backing.as_path().to_string_lossy().into_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            Some(MINIMUM_WRITEBACK_BUDGET_BYTES),
+            MetricsWriter::default().register_block_device("discard".into()),
+        )
+        .unwrap();
+        let mut disk = block.disk.take().unwrap();
+        disk.set_writeback_config(block.writeback_config.as_ref())
+            .unwrap();
+        assert!(disk.has_writeback_limit());
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut worker = BlockWorker::new(
+            DeviceQueue {
+                queue: crate::virtio::Queue::new(256),
+                event: Arc::new(EventFd::new(0).unwrap()),
+            },
+            InterruptTransport::new(DummyIrqChip::new().into(), "discard".into()).unwrap(),
+            mem.clone(),
+            disk,
+            EventFd::new(0).unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            MetricsWriter::default().register_block_device("discard".into()),
+        );
+        let mut discard = |sector: u64, num_sectors: u32| {
+            let chain = create_descriptor_chain(
+                &mem,
+                GuestAddress(0),
+                GuestAddress(0x1000),
+                vec![
+                    (DescriptorType::Readable, 16),
+                    (DescriptorType::Writable, 1),
+                ],
+                0,
+            )
+            .unwrap();
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&u64::to_le_bytes(sector));
+            payload.extend_from_slice(&u32::to_le_bytes(num_sectors));
+            payload.extend_from_slice(&u32::to_le_bytes(0));
+            mem.write_slice(&payload, GuestAddress(0x1000)).unwrap();
+            let header_mem = GuestAddress(0x2000);
+            mem.write_obj(VIRTIO_BLK_T_DISCARD, header_mem).unwrap();
+            let header: RequestHeader = mem.read_obj(header_mem).unwrap();
+            worker.process_request(
+                header,
+                &mut Reader::new(&mem, chain.clone()).unwrap(),
+                &mut Writer::new(&mem, chain).unwrap(),
+            )
+        };
+
+        // One MiB in the middle of the written head.
+        assert_eq!(discard(2048, 2048).unwrap(), 0);
+        // The whole image: several budget windows, each retired before the next is admitted.
+        assert_eq!(discard(0, (length / 512) as u32).unwrap(), 0);
+        // Past the visible capacity: refused before any prefix is punched.
+        assert!(matches!(
+            discard((length / 512) - 1, 2),
+            Err(RequestError::InvalidMutationRange(_))
+        ));
+        drop(worker);
+
+        let after = backing.as_file().metadata().unwrap().blocks();
+        assert!(
+            after * 512 < 4096,
+            "discarding the whole image must leave no allocated data (was {} blocks, now {after})",
+            allocated
+        );
+        let mut buf = vec![0u8; head];
+        backing.as_file().read_exact_at(&mut buf, 0).unwrap();
+        assert!(buf.iter().all(|b| *b == 0));
     }
 
     #[cfg(target_os = "linux")]

@@ -50,7 +50,6 @@ pub enum RequestError {
     InvalidDataLength,
     InvalidMutationRange(io::Error),
     ReadingFromDescriptor(io::Error),
-    UnsupportedMutation,
     WritingToDescriptor(io::Error),
     WritingZeroes(io::Error),
     UnknownRequest,
@@ -963,11 +962,6 @@ impl BlockWorker {
                 }
             }
             VIRTIO_BLK_T_DISCARD => {
-                if self.disk.has_writeback_limit() {
-                    // Bounded writeback deliberately does not advertise DISCARD. Reject a guest
-                    // that sends it anyway rather than admitting unaccounted metadata mutation.
-                    return Err(RequestError::UnsupportedMutation);
-                }
                 let discard_write_data: DiscardWriteData = reader
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
