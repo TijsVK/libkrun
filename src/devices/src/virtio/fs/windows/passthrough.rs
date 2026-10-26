@@ -1602,7 +1602,6 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::windows::fs::FileExt;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -1624,10 +1623,9 @@ mod tests {
     impl TempDir {
         fn new() -> Self {
             let mut path = std::env::temp_dir();
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+            // Windows' clock is too coarse to tell parallel tests apart; a counter is unique.
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let unique = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             path.push(format!("msb-krun-fs-test-{}-{unique}", std::process::id()));
             fs::create_dir(&path).unwrap();
             Self { path }

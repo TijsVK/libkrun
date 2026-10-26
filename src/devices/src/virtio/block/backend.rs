@@ -338,10 +338,9 @@ mod tests {
     }
 
     fn temp_image_path(test_name: &str) -> PathBuf {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        // Windows' clock is too coarse to tell parallel tests apart; a counter is unique.
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let timestamp = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!(
             "libkrun-explicit-block-{test_name}-{}-{timestamp}.img",
             std::process::id()

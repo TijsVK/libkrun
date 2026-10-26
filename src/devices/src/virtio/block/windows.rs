@@ -965,7 +965,6 @@ fn align_up(value: usize, alignment: usize) -> usize {
 mod tests {
     use std::collections::HashMap;
     use std::os::windows::fs::FileExt;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
@@ -1204,10 +1203,9 @@ mod tests {
     }
 
     fn temp_image_path(test_name: &str) -> std::path::PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        // Windows' clock is too coarse to tell parallel tests apart; a counter is unique.
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let timestamp = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         std::env::temp_dir().join(format!(
             "libkrun-block-iocp-{test_name}-{}-{timestamp}.img",

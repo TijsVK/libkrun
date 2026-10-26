@@ -713,7 +713,6 @@ mod tests {
     use std::io::Write;
     use std::os::windows::fs::FileExt;
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use imago::format::PreallocateMode;
     use imago::qcow2::Qcow2;
@@ -943,10 +942,9 @@ mod tests {
     }
 
     fn temp_image_path(test_name: &str) -> std::path::PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        // Windows' clock is too coarse to tell parallel tests apart; a counter is unique.
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let timestamp = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         std::env::temp_dir().join(format!(
             "libkrun-formatted-block-{test_name}-{}-{timestamp}.img",

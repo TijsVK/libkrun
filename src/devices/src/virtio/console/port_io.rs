@@ -1117,7 +1117,7 @@ mod tests {
     use std::fs::OpenOptions;
     use std::path::PathBuf;
     use std::sync::mpsc;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant};
     use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
     use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
     use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
@@ -1329,10 +1329,9 @@ mod tests {
     }
 
     fn temp_path(name: &str) -> PathBuf {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        // Windows' clock is too coarse to tell parallel tests apart; a counter is unique.
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let suffix = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!(
             "msb-krun-console-port-{}-{}-{suffix}.tmp",
             name,
@@ -1341,10 +1340,9 @@ mod tests {
     }
 
     fn unique_pipe_name() -> String {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        // Windows' clock is too coarse to tell parallel tests apart; a counter is unique.
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let suffix = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         format!(r"\\.\pipe\msb-krun-console-test-{suffix}")
     }

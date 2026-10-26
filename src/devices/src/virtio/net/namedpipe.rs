@@ -458,7 +458,7 @@ fn wide_null(value: &str) -> Vec<u16> {
 mod tests {
     use std::sync::mpsc;
     use std::thread;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
     use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
@@ -694,10 +694,9 @@ mod tests {
     }
 
     fn unique_pipe_name() -> String {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        // Windows' clock is too coarse to tell parallel tests apart; a counter is unique.
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let timestamp = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         format!(r"\\.\pipe\libkrun-net-test-{timestamp}")
     }
