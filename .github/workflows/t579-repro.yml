@@ -21,9 +21,9 @@ jobs:
         shell: bash
         run: |
           exe="$(cat exe.txt)"; fail=0; coll=0
-          for i in $(seq 1 60); do
+          for i in $(seq 1 600); do
             if ! "$exe" --test-threads=16 virtio::fs::windows::passthrough::tests virtio::block virtio::console::port_io virtio::file_traits > run.log 2>&1; then
-              fail=$((fail+1)); grep -E "FAILED|panicked|AlreadyExists" run.log | head -5
+              fail=$((fail+1)); grep -E "FAILED|panicked" run.log | head -8
             fi
           done
-          echo "RESULT shard=${{ matrix.shard }} failed_runs=$fail of 60"
+          echo "RESULT shard=${{ matrix.shard }} failed_runs=$fail of 600"
