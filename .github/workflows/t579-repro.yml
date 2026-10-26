@@ -1,0 +1,29 @@
+name: t579 repro
+on:
+  push:
+    branches: [t579-fixcheck]
+jobs:
+  loop:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build test binary
+        shell: bash
+        run: |
+          cargo test --locked --manifest-path src/devices/Cargo.toml --lib --no-run 2>&1 | tee build.log
+          grep -o 'target[^)]*msb_krun_devices-[0-9a-f]*\.exe' build.log | head -1 > exe.txt
+          cat exe.txt
+      - name: Loop the Windows test sets
+        shell: bash
+        run: |
+          exe="$(cat exe.txt)"; fail=0; coll=0
+          for i in $(seq 1 600); do
+            if ! "$exe" --test-threads=16 virtio::fs::windows::passthrough::tests virtio::block virtio::console::port_io virtio::file_traits > run.log 2>&1; then
+              fail=$((fail+1)); grep -E "FAILED|panicked" run.log | head -8
+            fi
+          done
+          echo "RESULT shard=${{ matrix.shard }} failed_runs=$fail of 600"
