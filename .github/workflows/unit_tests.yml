@@ -36,6 +36,11 @@ jobs:
       - name: Virtio descriptor consume test
         run: cargo test --locked -p msb_krun_devices writer_consume_truncates_the_final_slice
 
+      # The block module builds only with the blk feature, so the plain `cargo test` above skips
+      # it. Includes grow-ahead: first writes fill their chunk's holes, the cap, discard refills.
+      - name: Virtio block tests
+        run: cargo test --locked -p msb_krun_devices --features blk virtio::block
+
   unit-tests-windows-x86_64:
     name: Unit tests (Windows x86_64)
     runs-on: windows-latest

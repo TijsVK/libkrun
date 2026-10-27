@@ -514,6 +514,9 @@ impl FileReadWriteAtVolatile for DiskProperties {
         // parser: a bounded mutation is accepted in full or rejected before its first writev.
         self.validate_mutation_range(offset, full_length_u64)?;
 
+        #[cfg(target_os = "linux")]
+        self.grow_ahead_before_write(offset, full_length_u64);
+
         let mut chunk_offset = offset;
         while !iovec.is_empty() {
             let plan = self.plan_buffered_mutation(chunk_offset, iovec.len())?;
@@ -530,6 +533,9 @@ impl FileReadWriteAtVolatile for DiskProperties {
                 })?;
             }
         }
+
+        #[cfg(target_os = "linux")]
+        self.grow_ahead_after_write(offset, full_length_u64);
         Ok(full_length)
     }
 }

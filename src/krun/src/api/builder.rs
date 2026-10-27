@@ -814,6 +814,7 @@ impl VmBuilder {
                 direct_io: config.direct_io,
                 sync_mode,
                 backend: explicit_backend,
+                grow_ahead: configured_disk.grow_ahead,
             };
 
             let writeback_limit = configured_disk.writeback_limit.or_else(|| {
@@ -1862,6 +1863,22 @@ mod tests {
         assert!(!builder.disk.configs[1].config.direct_io);
         assert_eq!(builder.disk.configs[1].config.sync, SyncMode::Full);
         assert_eq!(builder.disk.configs[1].writeback_limit_bytes, None);
+    }
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn disk_builder_grow_ahead_is_on_by_default_on_linux_and_per_disk() {
+        let builder = VmBuilder::new()
+            .disk(|d| d.path("/a.raw").grow_ahead(false))
+            .disk(|d| d.path("/b.raw"))
+            .disk(|d| d.path("/c.raw").grow_ahead(true));
+
+        assert!(!builder.disk.configs[0].grow_ahead);
+        assert_eq!(
+            builder.disk.configs[1].grow_ahead,
+            cfg!(target_os = "linux")
+        );
+        assert!(builder.disk.configs[2].grow_ahead);
     }
 
     #[cfg(feature = "blk")]

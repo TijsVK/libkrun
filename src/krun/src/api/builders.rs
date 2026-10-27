@@ -430,6 +430,7 @@ pub struct DiskBuilder {
     current_sync: SyncMode,
     current_writeback_limit_bytes: Option<u64>,
     current_writeback_limit: Option<WritebackLimit>,
+    current_grow_ahead: bool,
 }
 
 /// Configuration for a single block device.
@@ -467,6 +468,7 @@ pub(crate) struct ConfiguredDisk {
     pub(crate) layers: Option<Vec<DiskLayer>>,
     pub(crate) writeback_limit_bytes: Option<u64>,
     pub(crate) writeback_limit: Option<WritebackLimit>,
+    pub(crate) grow_ahead: bool,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1385,6 +1387,7 @@ impl DiskBuilder {
             current_sync: SyncMode::Full,
             current_writeback_limit_bytes: None,
             current_writeback_limit: None,
+            current_grow_ahead: devices::virtio::block::GROW_AHEAD_DEFAULT,
         }
     }
 
@@ -1488,6 +1491,19 @@ impl DiskBuilder {
         self
     }
 
+    /// Fill the holes of a 64 MiB chunk of the image with zeros on the guest's first write into
+    /// it, so the chunk's later writes need no host allocation.
+    ///
+    /// On by default on Linux hosts, where the first write into a hole of a sparse image costs
+    /// a host filesystem journal commit at the guest's next flush; at most 256 MiB of filled
+    /// space waits for the guest to write over it. It applies to writable raw disks opened by
+    /// path with writeback caching, buffered I/O and an active sync mode, and is ignored for
+    /// other disks and on other hosts.
+    pub fn grow_ahead(mut self, enabled: bool) -> Self {
+        self.current_grow_ahead = enabled;
+        self
+    }
+
     /// Finalize the builder (called internally).
     pub(crate) fn finalize(mut self) -> Self {
         self.finish_current();
@@ -1517,6 +1533,7 @@ impl DiskBuilder {
             layers: self.current_layers.take(),
             writeback_limit_bytes: self.current_writeback_limit_bytes,
             writeback_limit: self.current_writeback_limit.take(),
+            grow_ahead: self.current_grow_ahead,
         });
         self.current_read_only = false;
         self.current_format = DiskImageFormat::Raw;
@@ -1525,6 +1542,7 @@ impl DiskBuilder {
         self.current_sync = SyncMode::Full;
         self.current_writeback_limit_bytes = None;
         self.current_writeback_limit = None;
+        self.current_grow_ahead = devices::virtio::block::GROW_AHEAD_DEFAULT;
     }
 }
 

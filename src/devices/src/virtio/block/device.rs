@@ -37,6 +37,8 @@ use virtio_bindings::{
 use vm_memory::VolatileSlice;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
+#[cfg(target_os = "linux")]
+use super::growahead::{GrowAhead, GrowAheadConfig};
 #[cfg(windows)]
 use super::windows::{
     PendingWindowsRawFileOperation, WindowsRawFile, WindowsRawFileBuffer, WindowsRawFileCompletion,
@@ -108,6 +110,11 @@ pub(crate) struct DiskProperties {
     // Bounded mode must account real dirty data, so WRITE_ZEROES reuses this buffer instead of
     // invoking a filesystem hole-punch or metadata-only zeroing operation.
     explicit_zero_buffer: Option<Box<[u8]>>,
+    #[cfg(target_os = "linux")]
+    // Same single-worker ownership as the writeback controller above.
+    grow_ahead: Option<RefCell<GrowAhead>>,
+    #[cfg(target_os = "linux")]
+    grow_ahead_zeroes: Option<Box<[u8]>>,
     #[cfg(windows)]
     windows_raw_file: Option<Arc<WindowsRawFile>>,
     #[cfg(windows)]
@@ -160,6 +167,10 @@ impl DiskProperties {
             writeback_config: None,
             #[cfg(target_os = "linux")]
             explicit_zero_buffer: None,
+            #[cfg(target_os = "linux")]
+            grow_ahead: None,
+            #[cfg(target_os = "linux")]
+            grow_ahead_zeroes: None,
             #[cfg(windows)]
             windows_raw_file: None,
             #[cfg(windows)]
@@ -447,10 +458,14 @@ impl DiskProperties {
         // of the same span: a hole punch dirties filesystem metadata that `sync_file_range()`
         // cannot see, so the charge (retired by a sync of the span, which is cheap for a hole)
         // paces how fast a guest can create holes. Without a budget this is a single call.
-        self.run_buffered_mutation(offset, length, None, |chunk_offset, chunk_length| {
-            let mut diskfile = self.file.lock().unwrap();
-            diskfile.discard_to_any(chunk_offset, chunk_length)
-        })
+        let result =
+            self.run_buffered_mutation(offset, length, None, |chunk_offset, chunk_length| {
+                let mut diskfile = self.file.lock().unwrap();
+                diskfile.discard_to_any(chunk_offset, chunk_length)
+            });
+        #[cfg(target_os = "linux")]
+        self.grow_ahead_forget(offset, length);
+        result
     }
 
     pub(crate) fn discard_to_zero(&self, offset: u64, length: u64) -> io::Result<()> {
@@ -467,14 +482,23 @@ impl DiskProperties {
             return raw_file.discard_to_zero(offset, length);
         }
 
-        self.run_buffered_mutation(offset, length, None, |chunk_offset, chunk_length| {
-            let mut diskfile = self.file.lock().unwrap();
-            diskfile.discard_to_zero(chunk_offset, chunk_length)
-        })
+        let result =
+            self.run_buffered_mutation(offset, length, None, |chunk_offset, chunk_length| {
+                let mut diskfile = self.file.lock().unwrap();
+                diskfile.discard_to_zero(chunk_offset, chunk_length)
+            });
+        #[cfg(target_os = "linux")]
+        self.grow_ahead_forget(offset, length);
+        result
     }
 
     pub(crate) fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
         self.validate_mutation_range(offset, length)?;
+
+        // Without a writeback budget Imago zeroes a raw file with `FALLOC_FL_ZERO_RANGE`, which
+        // can leave unwritten extents behind, so the range is looked at again on its next write.
+        #[cfg(target_os = "linux")]
+        self.grow_ahead_forget(offset, length);
 
         #[cfg(target_os = "linux")]
         if let Some(zero_buffer) = &self.explicit_zero_buffer {
@@ -533,6 +557,62 @@ impl DiskProperties {
         }
 
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_grow_ahead(&mut self, file: File, config: GrowAheadConfig) -> io::Result<()> {
+        let grow_ahead = GrowAhead::new(file, config)?;
+        let mut zeroes = Vec::new();
+        zeroes
+            .try_reserve_exact(EXPLICIT_ZERO_BUFFER_BYTES)
+            .map_err(io::Error::other)?;
+        zeroes.resize(EXPLICIT_ZERO_BUFFER_BYTES, 0);
+        self.grow_ahead_zeroes = Some(zeroes.into_boxed_slice());
+        self.grow_ahead = Some(RefCell::new(grow_ahead));
+        Ok(())
+    }
+
+    /// Fills the holes of the chunks a guest write is about to touch for the first time.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn grow_ahead_before_write(&self, offset: u64, length: u64) {
+        let (Some(grow_ahead), Some(zeroes)) = (&self.grow_ahead, &self.grow_ahead_zeroes) else {
+            return;
+        };
+        let capacity = self.nsectors * SECTOR_SIZE;
+        grow_ahead.borrow_mut().before_write(
+            offset,
+            length,
+            capacity,
+            |fill_offset, fill_length| {
+                // Fill zeros are real dirty data: under a writeback budget they are charged like
+                // a guest write, so a fill cannot push the host past the budget.
+                self.run_buffered_mutation(
+                    fill_offset,
+                    fill_length,
+                    Some(zeroes.len() as u64),
+                    |chunk_offset, chunk_length| {
+                        let chunk_length = usize::try_from(chunk_length)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+                        let diskfile = self.file.lock().unwrap();
+                        diskfile.write(&zeroes[..chunk_length], chunk_offset)
+                    },
+                )
+            },
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn grow_ahead_after_write(&self, offset: u64, length: u64) {
+        if let Some(grow_ahead) = &self.grow_ahead {
+            grow_ahead.borrow_mut().after_write(offset, length);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn grow_ahead_forget(&self, offset: u64, length: u64) {
+        if let Some(grow_ahead) = &self.grow_ahead {
+            grow_ahead.borrow_mut().forget(offset, length);
+        }
     }
 
     #[cfg(windows)]
@@ -697,6 +777,10 @@ pub struct Block {
     disk_image_id: Vec<u8>,
     #[cfg(target_os = "linux")]
     writeback_config: Option<BufferedWritebackConfig>,
+    #[cfg(target_os = "linux")]
+    // A handle on a disk that grow-ahead may serve (writable raw, buffered, synced), kept until
+    // `enable_grow_ahead` hands it to the disk.
+    grow_ahead_file: Option<File>,
     #[cfg(windows)]
     windows_raw_file: Option<Arc<WindowsRawFile>>,
     metrics: BlockMetricsWriter,
@@ -937,6 +1021,20 @@ impl Block {
             None => None,
         };
 
+        // Grow-ahead only pays off where a guest flush syncs a host file whose first writes into
+        // holes cost a host journal commit: a writable raw image through the page cache.
+        #[cfg(target_os = "linux")]
+        let grow_ahead_file = if matches!(disk_image_format, ImageType::Raw)
+            && !is_disk_read_only
+            && !direct_io
+            && cache_type == CacheType::Writeback
+            && sync_mode != SyncMode::None
+        {
+            Some(disk_image.try_clone()?)
+        } else {
+            None
+        };
+
         // Keep Imago on its established open path. When advisory writeback is active, procfs
         // provides a race-free name for the already-verified inode without giving Imago the
         // controller's file description or changing its storage implementation.
@@ -1060,6 +1158,8 @@ impl Block {
             disk_image_id,
             #[cfg(target_os = "linux")]
             writeback_config,
+            #[cfg(target_os = "linux")]
+            grow_ahead_file,
             #[cfg(windows)]
             windows_raw_file,
             metrics,
@@ -1081,6 +1181,33 @@ impl Block {
     /// Provides the PARTUUID of this block device.
     pub fn partuuid(&self) -> Option<&String> {
         self.partuuid.as_ref()
+    }
+
+    /// Turns on grow-ahead for this disk: the first guest write into a 64 MiB chunk of the image
+    /// that still has holes fills those holes with zeros first, while at most 256 MiB of filled
+    /// space waits for the guest to write over it.
+    ///
+    /// Returns whether the disk uses it. Only a Linux host and a writable raw image opened by
+    /// path with writeback caching, buffered I/O and an active sync mode qualify; any other
+    /// disk, and every disk on other hosts, is left as it is. Call before activation.
+    pub fn enable_grow_ahead(&mut self) -> io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            self.enable_grow_ahead_with(GrowAheadConfig::default())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(false)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn enable_grow_ahead_with(&mut self, config: GrowAheadConfig) -> io::Result<bool> {
+        let (Some(file), Some(disk)) = (self.grow_ahead_file.take(), self.disk.as_mut()) else {
+            return Ok(false);
+        };
+        disk.set_grow_ahead(file, config)?;
+        Ok(true)
     }
 
     /// Specifies if this block device is read only.
@@ -1260,6 +1387,8 @@ impl Block {
             disk_image_id,
             #[cfg(target_os = "linux")]
             writeback_config: None,
+            #[cfg(target_os = "linux")]
+            grow_ahead_file: None,
             #[cfg(windows)]
             windows_raw_file: backend.windows_raw_file,
             metrics,
@@ -2142,6 +2271,219 @@ mod tests {
         let mut buf = vec![0u8; head];
         backing.as_file().read_exact_at(&mut buf, 0).unwrap();
         assert!(buf.iter().all(|b| *b == 0));
+    }
+
+    /// Holes of `file` in `[start, end)`, from `SEEK_HOLE`/`SEEK_DATA`.
+    #[cfg(target_os = "linux")]
+    fn image_holes(file: &File, start: u64, end: u64) -> Vec<(u64, u64)> {
+        let seek = |offset: u64, whence| {
+            // SAFETY: lseek only reads the descriptor, which `file` keeps open for the call.
+            let result = unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, whence) };
+            (result >= 0).then_some(result as u64)
+        };
+        let mut holes = Vec::new();
+        let mut position = start;
+        while let Some(hole) = seek(position, libc::SEEK_HOLE).filter(|hole| *hole < end) {
+            let data = seek(hole, libc::SEEK_DATA).unwrap_or(end).min(end);
+            holes.push((hole, data));
+            position = data;
+        }
+        holes
+    }
+
+    /// The device as a VMM builds it on Linux (bounded writeback, grow-ahead on): guest writes,
+    /// a discard and a flush go through the worker's request path, and the image ends up with
+    /// the guest's data where it wrote and zeros, not holes, in the rest of each touched chunk.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guest_writes_fill_their_chunks_and_a_discard_lets_the_chunk_fill_again() {
+        use std::os::unix::fs::FileExt;
+
+        use vm_memory::{Bytes, GuestAddress};
+
+        use super::super::worker::RequestHeader;
+        use crate::legacy::DummyIrqChip;
+        use crate::virtio::descriptor_utils::{
+            create_descriptor_chain, DescriptorType, Reader, Writer,
+        };
+
+        const MIB: u64 = 1024 * 1024;
+        let backing = TempFile::new().unwrap();
+        let length = 16 * MIB;
+        backing.as_file().set_len(length).unwrap();
+        assert_eq!(
+            image_holes(backing.as_file(), 0, length),
+            vec![(0, length)],
+            "the temp dir must report holes"
+        );
+        let mut block = Block::new_with_writeback_limit(
+            "grow-ahead".into(),
+            None,
+            CacheType::Writeback,
+            backing.as_path().to_string_lossy().into_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            Some(MINIMUM_WRITEBACK_BUDGET_BYTES),
+            MetricsWriter::default().register_block_device("grow-ahead".into()),
+        )
+        .unwrap();
+        assert!(block
+            .enable_grow_ahead_with(GrowAheadConfig {
+                chunk_bytes: 4 * MIB,
+                cap_bytes: 8 * MIB,
+            })
+            .unwrap());
+        let mut disk = block.disk.take().unwrap();
+        disk.set_writeback_config(block.writeback_config.as_ref())
+            .unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x100000)]).unwrap();
+        let mut worker = BlockWorker::new(
+            DeviceQueue {
+                queue: crate::virtio::Queue::new(256),
+                event: Arc::new(EventFd::new(0).unwrap()),
+            },
+            InterruptTransport::new(DummyIrqChip::new().into(), "grow-ahead".into()).unwrap(),
+            mem.clone(),
+            disk,
+            EventFd::new(0).unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            MetricsWriter::default().register_block_device("grow-ahead".into()),
+        );
+        // One request: header (type, reserved, sector), then `payload` as the readable buffer.
+        let mut request = |kind: u32, sector: u64, payload: &[u8]| {
+            let chain = create_descriptor_chain(
+                &mem,
+                GuestAddress(0),
+                GuestAddress(0x1000),
+                vec![
+                    (DescriptorType::Readable, payload.len() as u32),
+                    (DescriptorType::Writable, 1),
+                ],
+                0,
+            )
+            .unwrap();
+            mem.write_slice(payload, GuestAddress(0x1000)).unwrap();
+            let header_mem = GuestAddress(0x80000);
+            let mut header = Vec::new();
+            header.extend_from_slice(&kind.to_le_bytes());
+            header.extend_from_slice(&0u32.to_le_bytes());
+            header.extend_from_slice(&sector.to_le_bytes());
+            mem.write_slice(&header, header_mem).unwrap();
+            let header: RequestHeader = mem.read_obj(header_mem).unwrap();
+            worker
+                .process_request(
+                    header,
+                    &mut Reader::new(&mem, chain.clone()).unwrap(),
+                    &mut Writer::new(&mem, chain).unwrap(),
+                )
+                .unwrap()
+        };
+        let discard = |sector: u64, sectors: u32| {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&sector.to_le_bytes());
+            payload.extend_from_slice(&sectors.to_le_bytes());
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload
+        };
+
+        // A write into chunk 1 fills chunk 1 and nothing else.
+        request(VIRTIO_BLK_T_OUT, (5 * MIB) / 512, &[0xa1; 8192]);
+        let file = backing.as_file();
+        assert_eq!(image_holes(file, 4 * MIB, 8 * MIB), vec![]);
+        // Chunk 0 is untouched by the guest (Imago's open-time alignment probe may have written
+        // its first block, so only "still has holes" is checked there).
+        assert!(!image_holes(file, 0, 4 * MIB).is_empty());
+        assert_eq!(image_holes(file, 8 * MIB, length), vec![(8 * MIB, length)]);
+        // A second chunk fits under the 8 MiB cap; a third would not and stays sparse.
+        request(VIRTIO_BLK_T_OUT, 0, &[0xb2; 4096]);
+        request(VIRTIO_BLK_T_OUT, (9 * MIB) / 512, &[0xc3; 4096]);
+        assert_eq!(image_holes(file, 0, 4 * MIB), vec![]);
+        assert_eq!(
+            image_holes(file, 8 * MIB, 12 * MIB),
+            vec![(8 * MIB, 9 * MIB), (9 * MIB + 4096, 12 * MIB)]
+        );
+
+        // A discard of chunk 1 punches it; the next write there fills it again.
+        assert_eq!(
+            request(
+                VIRTIO_BLK_T_DISCARD,
+                (4 * MIB) / 512,
+                &discard((4 * MIB) / 512, 8192)
+            ),
+            0
+        );
+        assert_eq!(
+            image_holes(file, 4 * MIB, 8 * MIB),
+            vec![(4 * MIB, 8 * MIB)]
+        );
+        request(VIRTIO_BLK_T_OUT, (6 * MIB) / 512, &[0xd4; 4096]);
+        assert_eq!(image_holes(file, 4 * MIB, 8 * MIB), vec![]);
+        request(VIRTIO_BLK_T_FLUSH, 0, &[]);
+        drop(worker);
+
+        let mut bytes = vec![0xffu8; length as usize];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        let expect = |start: u64, len: u64, value: u8| {
+            let (start, end) = (start as usize, (start + len) as usize);
+            assert!(
+                bytes[start..end].iter().all(|b| *b == value),
+                "{start}..{end}"
+            );
+        };
+        expect(0, 4096, 0xb2);
+        expect(4096, 6 * MIB - 4096, 0);
+        expect(6 * MIB, 4096, 0xd4);
+        expect(6 * MIB + 4096, 3 * MIB - 4096, 0);
+        expect(9 * MIB, 4096, 0xc3);
+        expect(9 * MIB + 4096, length - 9 * MIB - 4096, 0);
+    }
+
+    /// Grow-ahead is for writable raw images through the page cache with an active sync; the
+    /// other disks keep working without it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grow_ahead_applies_only_to_writable_buffered_synced_raw_disks() {
+        let backing = TempFile::new().unwrap();
+        backing.as_file().set_len(1024 * 1024).unwrap();
+        let path = backing.as_path().to_string_lossy().into_owned();
+        let qualifies = |cache, read_only, sync| {
+            Block::new(
+                "qualify".into(),
+                None,
+                cache,
+                path.clone(),
+                ImageType::Raw,
+                read_only,
+                false,
+                sync,
+                MetricsWriter::default().register_block_device("qualify".into()),
+            )
+            .unwrap()
+            .enable_grow_ahead()
+            .unwrap()
+        };
+        assert!(qualifies(CacheType::Writeback, false, SyncMode::Full));
+        assert!(qualifies(CacheType::Writeback, false, SyncMode::Relaxed));
+        assert!(!qualifies(CacheType::Writeback, true, SyncMode::Full));
+        assert!(!qualifies(CacheType::Unsafe, false, SyncMode::Full));
+        assert!(!qualifies(CacheType::Writeback, false, SyncMode::None));
+
+        let mut block = Block::new(
+            "twice".into(),
+            None,
+            CacheType::Writeback,
+            path.clone(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            MetricsWriter::default().register_block_device("twice".into()),
+        )
+        .unwrap();
+        assert!(block.enable_grow_ahead().unwrap());
+        assert!(!block.enable_grow_ahead().unwrap(), "already handed over");
     }
 
     #[cfg(target_os = "linux")]

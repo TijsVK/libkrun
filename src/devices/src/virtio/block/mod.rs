@@ -7,6 +7,8 @@ use super::QueueConfig;
 
 mod backend;
 pub mod device;
+#[cfg(target_os = "linux")]
+mod growahead;
 mod limit;
 mod unavailable;
 #[cfg(windows)]
@@ -18,6 +20,11 @@ mod writeback;
 pub use self::backend::{BlockBackendSpec, BlockLayerSpec, PreparedBlockBackend};
 pub use self::device::{Block, BlockState, CacheType};
 pub use self::limit::WritebackLimit;
+
+/// Whether a disk fills the holes of a chunk on its first write unless the caller says otherwise:
+/// on for Linux hosts, where it saves the host journal commit of first writes into holes. Other
+/// hosts accept the setting and ignore it.
+pub const GROW_AHEAD_DEFAULT: bool = cfg!(target_os = "linux");
 
 pub const CONFIG_SPACE_SIZE: usize = 8;
 /// Version of the stable virtio-block device state contract.

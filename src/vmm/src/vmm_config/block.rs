@@ -36,6 +36,9 @@ pub struct BlockDeviceConfig {
     pub sync_mode: SyncMode,
     /// Caller-resolved dependency chain; `None` retains legacy path/header resolution.
     pub backend: Option<BlockBackendSpec>,
+    /// Fill a chunk's holes on its first write (`Block::enable_grow_ahead`). Ignored for an
+    /// explicit chain and for disks or hosts it does not apply to.
+    pub grow_ahead: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,7 +136,7 @@ impl BlockBuilder {
             )
             .map_err(BlockConfigError::CreateBlockDevice);
         }
-        devices::virtio::Block::new_with_writeback_limit_handle(
+        let mut block = devices::virtio::Block::new_with_writeback_limit_handle(
             config.block_id,
             None,
             config.cache_type,
@@ -145,6 +148,12 @@ impl BlockBuilder {
             writeback_limit,
             device_metrics,
         )
-        .map_err(BlockConfigError::CreateBlockDevice)
+        .map_err(BlockConfigError::CreateBlockDevice)?;
+        if config.grow_ahead {
+            block
+                .enable_grow_ahead()
+                .map_err(BlockConfigError::CreateBlockDevice)?;
+        }
+        Ok(block)
     }
 }

@@ -788,6 +788,7 @@ pub unsafe extern "C" fn krun_add_disk(
                 #[cfg(target_os = "macos")]
                 sync_mode: SyncMode::Relaxed,
                 backend: None,
+                grow_ahead: devices::virtio::block::GROW_AHEAD_DEFAULT,
             };
             cfg.add_block_cfg(block_device_config);
         }
@@ -840,6 +841,7 @@ pub unsafe extern "C" fn krun_add_disk2(
                 #[cfg(target_os = "macos")]
                 sync_mode: SyncMode::Relaxed,
                 backend: None,
+                grow_ahead: devices::virtio::block::GROW_AHEAD_DEFAULT,
             };
             cfg.add_block_cfg(block_device_config);
         }
@@ -896,6 +898,7 @@ pub unsafe extern "C" fn krun_add_disk3(
                 direct_io,
                 sync_mode,
                 backend: None,
+                grow_ahead: devices::virtio::block::GROW_AHEAD_DEFAULT,
             };
             cfg.add_block_cfg(block_device_config);
         }
@@ -929,6 +932,7 @@ pub unsafe extern "C" fn krun_set_root_disk(ctx_id: u32, c_disk_path: *const c_c
                 #[cfg(target_os = "macos")]
                 sync_mode: SyncMode::Relaxed,
                 backend: None,
+                grow_ahead: devices::virtio::block::GROW_AHEAD_DEFAULT,
             };
             cfg.set_root_block_cfg(block_device_config);
         }
@@ -962,6 +966,7 @@ pub unsafe extern "C" fn krun_set_data_disk(ctx_id: u32, c_disk_path: *const c_c
                 #[cfg(target_os = "macos")]
                 sync_mode: SyncMode::Relaxed,
                 backend: None,
+                grow_ahead: devices::virtio::block::GROW_AHEAD_DEFAULT,
             };
             cfg.set_data_block_cfg(block_device_config);
         }
