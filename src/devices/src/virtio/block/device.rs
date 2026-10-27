@@ -1193,7 +1193,15 @@ impl Block {
     pub fn enable_grow_ahead(&mut self) -> io::Result<bool> {
         #[cfg(target_os = "linux")]
         {
-            self.enable_grow_ahead_with(GrowAheadConfig::default())
+            let mut config = GrowAheadConfig::default();
+            let mib = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
+            if let Some(chunk) = mib("KRUN_GROW_AHEAD_CHUNK_MIB") {
+                config.chunk_bytes = chunk << 20;
+            }
+            if let Some(cap) = mib("KRUN_GROW_AHEAD_CAP_MIB") {
+                config.cap_bytes = cap << 20;
+            }
+            self.enable_grow_ahead_with(config)
         }
         #[cfg(not(target_os = "linux"))]
         {

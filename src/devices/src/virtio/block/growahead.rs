@@ -219,6 +219,7 @@ impl GrowAhead {
             return Ok(());
         }
         if self.unused_bytes + fill_bytes > self.config.cap_bytes {
+            trace_event(format_args!("defer chunk={index} need={fill_bytes} unused={}", self.unused_bytes));
             self.chunks[index] = Chunk::Deferred {
                 hole_bytes: fill_bytes,
             };
@@ -233,6 +234,7 @@ impl GrowAhead {
             written += end - start;
         }
         self.filled_bytes += written;
+        trace_event(format_args!("fill chunk={index} wrote={written} unused={}", self.unused_bytes + fill_bytes));
         debug!(
             "grow-ahead filled {written} bytes of holes in chunk {index} ({} bytes unused now)",
             self.unused_bytes + fill_bytes
@@ -289,6 +291,15 @@ impl GrowAhead {
             let last = (end.min(chunk_end) - 1 - chunk_start) / GRANULE;
             visit(self, index, first, last);
             chunk_start = chunk_end;
+        }
+    }
+}
+
+fn trace_event(line: std::fmt::Arguments) {
+    use std::io::Write;
+    if let Ok(path) = std::env::var("KRUN_GROW_AHEAD_LOG") {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{line}");
         }
     }
 }
