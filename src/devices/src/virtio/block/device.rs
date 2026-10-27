@@ -231,17 +231,33 @@ impl DiskProperties {
             .as_ref()
             .and_then(|controller| controller.borrow_mut().quiesce().err());
 
+        // On Windows `FlushFileBuffers` flushes the file whichever handle it is called on, and
+        // each call sends a flush command to the disk. A second call on Imago's handle after
+        // this one has nothing left to write but still costs a disk flush, so Imago's `sync`
+        // is skipped when the raw handle just flushed the image (Imago's `flush` still runs).
         #[cfg(windows)]
-        if let Some(raw_file) = &self.windows_raw_file {
-            raw_file.flush()?;
-        }
+        let raw_file_flushed = match &self.windows_raw_file {
+            Some(raw_file) => {
+                raw_file.flush()?;
+                true
+            }
+            None => false,
+        };
+        #[cfg(not(windows))]
+        let raw_file_flushed = false;
 
         // The full Imago flush remains the guest-visible durability fence, so run it even after
         // the background controller fails. A successful later sync cannot erase a writeback error
         // already reported through the file description; that controller remains failed closed.
         let sync_result = {
             let diskfile = self.file.lock().unwrap();
-            diskfile.flush().and_then(|_| diskfile.sync())
+            diskfile.flush().and_then(|_| {
+                if raw_file_flushed {
+                    Ok(())
+                } else {
+                    diskfile.sync()
+                }
+            })
         };
 
         #[cfg(target_os = "linux")]
@@ -1565,6 +1581,64 @@ mod tests {
         .unwrap();
 
         block.disk.as_ref().unwrap().flush_to_disk().unwrap();
+        drop(block);
+        std::fs::remove_file(image).unwrap();
+    }
+
+    // The raw handle's flush is the only disk flush a guest flush makes on Windows (Imago's `sync`
+    // is skipped), so a write made through either handle must be in the file afterwards.
+    #[cfg(windows)]
+    #[test]
+    fn guest_flush_persists_writes_made_through_the_raw_handle_and_imagos_handle() {
+        let image = temp_image_path("flush-both-handles");
+        let file = File::create(&image).unwrap();
+        file.set_len(1024 * 1024).unwrap();
+        drop(file);
+        let block = Block::new(
+            "both-handles".to_string(),
+            None,
+            CacheType::Writeback,
+            image.to_string_lossy().into_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            MetricsWriter::default().register_block_device("both-handles".to_string()),
+        )
+        .unwrap();
+        let disk = block.disk.as_ref().unwrap();
+        assert!(disk.has_windows_raw_file());
+
+        let through_raw = vec![0x11u8; 4096];
+        let mem: GuestMemoryMmap<()> =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x2000)]).unwrap();
+        mem.write_slice(&through_raw, GuestAddress(0)).unwrap();
+        let source = mem.get_slice(GuestAddress(0), through_raw.len()).unwrap();
+        let written = disk
+            .windows_raw_write_vectored_at_volatile(&[source], 0x1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(written, through_raw.len());
+
+        let through_imago = vec![0x22u8; 4096];
+        block
+            .disk_image
+            .lock()
+            .unwrap()
+            .write(&through_imago[..], 0x3000)
+            .unwrap();
+
+        disk.flush_to_disk().unwrap();
+
+        use std::os::windows::fs::FileExt;
+        let reader = File::open(&image).unwrap();
+        let mut actual = vec![0u8; 4096];
+        reader.seek_read(&mut actual, 0x1000).unwrap();
+        assert_eq!(actual, through_raw);
+        reader.seek_read(&mut actual, 0x3000).unwrap();
+        assert_eq!(actual, through_imago);
+
+        drop(reader);
         drop(block);
         std::fs::remove_file(image).unwrap();
     }
