@@ -908,8 +908,32 @@ int reopen_fd(int fd, char *path, int flags)
     return 0;
 }
 
+/*
+ * The kernel opens fds 0-2 on /dev/console for init, but only if a console is
+ * registered by then. The virtio-console port behind it is added by the guest
+ * driver asynchronously, so on a loaded host init can start with no stdio at
+ * all. Fill each closed one with /dev/null, so that the opendir() and open()
+ * calls in setup_redirects() never land on 0-2 and reopen_fd() always
+ * replaces a live descriptor.
+ */
+static void ensure_std_fds()
+{
+    for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
+        if (fcntl(fd, F_GETFD) >= 0 || errno != EBADF) {
+            continue;
+        }
+        int nullfd = open("/dev/null", O_RDWR);
+        if (nullfd >= 0 && nullfd != fd) {
+            dup2(nullfd, fd);
+            close(nullfd);
+        }
+    }
+}
+
 int setup_redirects()
 {
+    ensure_std_fds();
+
     DIR *ports_dir = opendir("/sys/class/virtio-ports");
     if (ports_dir == NULL) {
         printf("Unable to open ports directory!\n");
