@@ -77,7 +77,7 @@ jobs:
       # A guest flush on a raw image flushes through libkrun's own handle only; Imago's second
       # FlushFileBuffers is skipped. The test writes through both handles and reads the file back.
       - name: Windows block flush tests
-        run: cargo test --locked --manifest-path src/devices/Cargo.toml guest_flush_persists
+        run: cargo test --locked --manifest-path src/devices/Cargo.toml --features blk guest_flush_persists
 
       - name: Windows device Clippy
         run: cargo clippy --locked --manifest-path src/devices/Cargo.toml -- -D warnings

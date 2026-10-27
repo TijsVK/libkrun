@@ -1609,6 +1609,8 @@ mod tests {
         let disk = block.disk.as_ref().unwrap();
         assert!(disk.has_windows_raw_file());
 
+        use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend};
+
         let through_raw = vec![0x11u8; 4096];
         let mem: GuestMemoryMmap<()> =
             GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x2000)]).unwrap();
