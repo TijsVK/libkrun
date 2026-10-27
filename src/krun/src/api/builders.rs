@@ -1491,7 +1491,7 @@ impl DiskBuilder {
         self
     }
 
-    /// Fill the holes of a 64 MiB chunk of the image with zeros on the guest's first write into
+    /// Fill the holes of a 16 MiB chunk of the image with zeros on the guest's first write into
     /// it, so the chunk's later writes need no host allocation.
     ///
     /// On by default on Linux hosts, where the first write into a hole of a sparse image costs

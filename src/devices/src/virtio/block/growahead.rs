@@ -16,6 +16,12 @@
 //! the whole disk cannot grow the image toward its full size. A guest discard (or write-zeroes)
 //! in a chunk returns it to the unchecked state: the punched range is a hole again and the next
 //! write may fill it again.
+//!
+//! The accounting lives in the device and starts again at zero each time the device is built:
+//! zeros a previous run left unused are then ordinary data. A guest trim (free space includes
+//! them) is what returns them to the host. Fills the guest never writes over keep counting against
+//! the cap, so the chunk size matters: a large chunk filled for a few metadata writes at boot can
+//! use the whole cap before the workload starts.
 
 use std::fs::File;
 use std::io;
@@ -35,10 +41,15 @@ pub struct GrowAheadConfig {
     pub cap_bytes: u64,
 }
 
+// Measured with a JDK and Maven `apt-get install` on a fresh 4 GiB root (about 6000 guest flushes,
+// a Linux ext4 host): host journal commits 2074 without grow-ahead, 24 with 16 MiB chunks (root
+// 720 MiB against 592), 39 with 8 MiB (672 MiB). 64 MiB chunks filled 194 MiB at boot alone and
+// left no room under the cap for the install's chunks (2077 commits); uncapped they reach 30 commits
+// for a 960 MiB root.
 impl Default for GrowAheadConfig {
     fn default() -> Self {
         Self {
-            chunk_bytes: 64 * 1024 * 1024,
+            chunk_bytes: 16 * 1024 * 1024,
             cap_bytes: 256 * 1024 * 1024,
         }
     }

@@ -1183,7 +1183,7 @@ impl Block {
         self.partuuid.as_ref()
     }
 
-    /// Turns on grow-ahead for this disk: the first guest write into a 64 MiB chunk of the image
+    /// Turns on grow-ahead for this disk: the first guest write into a 16 MiB chunk of the image
     /// that still has holes fills those holes with zeros first, while at most 256 MiB of filled
     /// space waits for the guest to write over it.
     ///
