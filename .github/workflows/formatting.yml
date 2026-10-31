@@ -1,5 +1,8 @@
 name: Code Formatting
-on: [pull_request]
+on:
+  pull_request:
+  push:
+    branches: [task/t883-device-hardening-ci]
 
 jobs:
   formatting:
