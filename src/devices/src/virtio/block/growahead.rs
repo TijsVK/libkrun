@@ -68,8 +68,13 @@ enum Chunk {
 }
 
 /// Granules of one chunk that hold fill zeros the guest has not written over.
+///
+/// The last chunk of an image is short when the capacity is not a multiple of the chunk size, so
+/// its map has fewer granules than a full chunk. Ranges are clamped to the map: a guest request
+/// that runs past the capacity (legacy disks do not refuse one) must not index past it.
 struct FillMap {
     bits: Vec<u64>,
+    granules: u64,
     count: u64,
 }
 
@@ -77,14 +82,20 @@ impl FillMap {
     fn new(granules: u64) -> Self {
         Self {
             bits: vec![0; granules.div_ceil(64) as usize],
+            granules,
             count: 0,
         }
+    }
+
+    /// The granules of `[first, last]` that lie in this map.
+    fn clamp(&self, first: u64, last: u64) -> std::ops::Range<u64> {
+        first..last.saturating_add(1).min(self.granules)
     }
 
     /// Marks granules `[first, last]` as filled; returns how many were newly marked.
     fn set(&mut self, first: u64, last: u64) -> u64 {
         let mut added = 0;
-        for granule in first..=last {
+        for granule in self.clamp(first, last) {
             let (word, bit) = ((granule / 64) as usize, granule % 64);
             if self.bits[word] & (1 << bit) == 0 {
                 self.bits[word] |= 1 << bit;
@@ -98,7 +109,7 @@ impl FillMap {
     /// Clears granules `[first, last]`; returns how many were cleared.
     fn clear(&mut self, first: u64, last: u64) -> u64 {
         let mut removed = 0;
-        for granule in first..=last {
+        for granule in self.clamp(first, last) {
             let (word, bit) = ((granule / 64) as usize, granule % 64);
             if self.bits[word] & (1 << bit) != 0 {
                 self.bits[word] &= !(1 << bit);
@@ -424,6 +435,38 @@ mod tests {
             vec![(0, size)],
             "the temp dir must report holes"
         );
+    }
+
+    #[test]
+    fn a_write_past_the_capacity_in_the_short_last_chunk_is_clamped() {
+        // A capacity that ends two granules into the last chunk, so its fill map holds two.
+        let capacity = MIB + 2 * GRANULE;
+        let (path, file) = sparse_image("short-last-chunk", capacity);
+        assert_reports_holes(&file, capacity);
+        let mut policy = policy(&file, MIB, 4 * MIB);
+
+        // The first write fills the other granule of the short chunk.
+        guest_write(&mut policy, &file, MIB, &[0xab; GRANULE as usize], capacity);
+        assert_eq!(policy.unused_bytes(), GRANULE);
+
+        // A legacy disk does not refuse a write that runs past the capacity, so the device
+        // reports one that covers far more granules than the short chunk's map holds.
+        guest_write(
+            &mut policy,
+            &file,
+            MIB + GRANULE,
+            &[0xcd; 512 * 1024],
+            capacity,
+        );
+        assert_eq!(
+            policy.unused_bytes(),
+            0,
+            "the filled granule was written over"
+        );
+
+        policy.forget(MIB, 512 * 1024);
+        assert_eq!(policy.unused_bytes(), 0);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
