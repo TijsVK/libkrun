@@ -478,7 +478,11 @@ impl MmioTransport {
             return Ok(());
         }
 
-        self.activate();
+        if !self.activate() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "restored virtio device could not be activated",
+            ));
+        }
         for event in &self.queue_evts {
             event.write(1).map_err(VirtioStateError::Device)?;
         }
@@ -545,10 +549,24 @@ impl MmioTransport {
         // . Do not reset config_generation and keep it monotonically increasing
     }
 
-    fn activate(&mut self) {
-        let Some(queues) = self.queues.take() else {
-            return;
+    /// Hands the queues to the device. Returns false, and leaves the device inactive with the
+    /// queues kept here, when a queue the driver marked ready does not lie in guest memory; the
+    /// devices access the rings without further bounds checks.
+    fn activate(&mut self) -> bool {
+        let Some(queues) = self.queues.as_ref() else {
+            return false;
         };
+        if let Some(index) = queues
+            .iter()
+            .position(|queue| queue.ready && !queue.is_valid(&self.mem))
+        {
+            error!(
+                "virtio-mmio {}: queue {index} is invalid, device not activated",
+                self.locked_device().device_name()
+            );
+            return false;
+        }
+        let queues = self.queues.take().expect("queues were checked above");
 
         let mut device_queues: Vec<DeviceQueue> = queues
             .into_iter()
@@ -562,9 +580,16 @@ impl MmioTransport {
         for dq in &mut device_queues {
             dq.queue.set_event_idx(event_idx_enabled);
         }
-        locked_device
-            .activate(self.mem.clone(), self.interrupt.clone(), device_queues)
-            .expect("Failed to activate device");
+        if let Err(error) =
+            locked_device.activate(self.mem.clone(), self.interrupt.clone(), device_queues)
+        {
+            error!(
+                "virtio-mmio {}: device activation failed: {error:?}",
+                locked_device.device_name()
+            );
+            return false;
+        }
+        true
     }
 
     /// Update device status according to the state machine defined by VirtIO Spec 1.0.
@@ -591,8 +616,9 @@ impl MmioTransport {
             DRIVER_OK if self.device_status == (ACKNOWLEDGE | DRIVER | FEATURES_OK) => {
                 self.device_status = status;
                 let device_activated = self.locked_device().is_activated();
-                if !device_activated {
-                    self.activate();
+                if !device_activated && !self.activate() {
+                    // Virtio 1.2 section 2.1.1: the driver must reset the device to use it again.
+                    self.device_status |= DEVICE_NEEDS_RESET;
                 }
             }
             _ if (status & FAILED) != 0 => {
@@ -1363,5 +1389,64 @@ pub(crate) mod tests {
         dummy_dev.set_avail_features(8);
         dummy_dev.ack_features_by_page(0, 8);
         assert_eq!(dummy_dev.acked_features(), 24);
+    }
+
+    /// Writes one 32-bit transport register as the guest driver does.
+    fn write_register(d: &mut MmioTransport, offset: u64, value: u32) {
+        let mut buf = [0; 4];
+        write_le_u32(&mut buf[..], value);
+        d.write(0, offset, &buf[..]);
+    }
+
+    /// Runs the guest's setup sequence with every queue at `avail_ring` (descriptors and used ring
+    /// at 0) and sets DRIVER_OK.
+    fn driver_setup(d: &mut MmioTransport, avail_ring: u64) {
+        set_device_status(d, device_status::ACKNOWLEDGE);
+        set_device_status(d, device_status::ACKNOWLEDGE | device_status::DRIVER);
+        set_device_status(
+            d,
+            device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK,
+        );
+        for queue in 0..2 {
+            write_register(d, 0x30, queue);
+            write_register(d, 0x38, 16);
+            write_register(d, 0x90, avail_ring as u32);
+            write_register(d, 0x94, (avail_ring >> 32) as u32);
+            write_register(d, 0x44, 1);
+        }
+        set_device_status(
+            d,
+            device_status::ACKNOWLEDGE
+                | device_status::DRIVER
+                | device_status::FEATURES_OK
+                | device_status::DRIVER_OK,
+        );
+    }
+
+    #[test]
+    fn activation_refuses_a_ready_queue_outside_guest_memory() {
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut d = MmioTransport::new(
+            m,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(DummyDevice::new())),
+        )
+        .unwrap();
+
+        // A ring past the end of guest RAM: the device would read it on the first kick.
+        driver_setup(&mut d, 0x10_0000);
+        assert!(!d.locked_device().is_activated());
+        assert_ne!(d.device_status & device_status::DEVICE_NEEDS_RESET, 0);
+        assert!(
+            d.queues.is_some(),
+            "the transport keeps the queues it refused"
+        );
+
+        // After a reset the same driver with a ring in memory gets a working device.
+        set_device_status(&mut d, 0);
+        assert_eq!(d.device_status, device_status::INIT);
+        driver_setup(&mut d, 0x800);
+        assert!(d.locked_device().is_activated());
+        assert_eq!(d.device_status & device_status::DEVICE_NEEDS_RESET, 0);
     }
 }

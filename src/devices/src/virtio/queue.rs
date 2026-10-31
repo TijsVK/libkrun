@@ -513,6 +513,12 @@ impl Queue {
         min(self.size, self.max_size)
     }
 
+    /// Checks the configuration the driver wrote: a ready queue with a power-of-two size whose
+    /// descriptor table and both rings lie entirely in guest memory and are aligned.
+    ///
+    /// `pop` and `add_used` read and write the rings without further bounds checks, so a device
+    /// must only receive a queue that passed this check (the MMIO transport checks every ready
+    /// queue before activating its device).
     pub fn is_valid(&self, mem: &GuestMemoryMmap) -> bool {
         let queue_size = u64::from(self.actual_size());
         let desc_table = self.desc_table;
@@ -521,6 +527,11 @@ impl Queue {
         let avail_ring_size = 6 + 2 * queue_size;
         let used_ring = self.used_ring;
         let used_ring_size = 6 + 8 * queue_size;
+        // The whole range must be backed: a ring that starts in a hole between memory regions
+        // (or runs into one) would make a later ring access fail.
+        let in_memory = |start: GuestAddress, size: u64| {
+            start.checked_add(size).is_some() && mem.check_range(start, size as usize)
+        };
         if !self.ready {
             error!("attempt to use virtio queue that is not marked ready");
             false
@@ -528,30 +539,21 @@ impl Queue {
         {
             error!("virtio queue with invalid size: {}", self.size);
             false
-        } else if desc_table
-            .checked_add(desc_table_size)
-            .is_none_or(|v| !mem.address_in_range(v))
-        {
+        } else if !in_memory(desc_table, desc_table_size) {
             error!(
                 "virtio queue descriptor table goes out of bounds: start:0x{:08x} size:0x{:08x}",
                 desc_table.raw_value(),
                 desc_table_size
             );
             false
-        } else if avail_ring
-            .checked_add(avail_ring_size)
-            .is_none_or(|v| !mem.address_in_range(v))
-        {
+        } else if !in_memory(avail_ring, avail_ring_size) {
             error!(
                 "virtio queue available ring goes out of bounds: start:0x{:08x} size:0x{:08x}",
                 avail_ring.raw_value(),
                 avail_ring_size
             );
             false
-        } else if used_ring
-            .checked_add(used_ring_size)
-            .is_none_or(|v| !mem.address_in_range(v))
-        {
+        } else if !in_memory(used_ring, used_ring_size) {
             error!(
                 "virtio queue used ring goes out of bounds: start:0x{:08x} size:0x{:08x}",
                 used_ring.raw_value(),
@@ -574,8 +576,21 @@ impl Queue {
 
     /// Returns the number of yet-to-be-popped descriptor chains in the avail ring.
     #[allow(clippy::len_without_is_empty)]
+    ///
+    /// A queue the driver never made ready has none. An unreadable ring (only possible for a
+    /// queue that skipped [`is_valid`](Self::is_valid)) is logged and reads as empty instead of
+    /// panicking the VMM.
     pub fn len(&self, mem: &GuestMemoryMmap) -> u16 {
-        (self.avail_idx(mem, Ordering::Acquire).unwrap() - self.next_avail).0
+        if !self.ready {
+            return 0;
+        }
+        match self.avail_idx(mem, Ordering::Acquire) {
+            Ok(avail_idx) => (avail_idx - self.next_avail).0,
+            Err(error) => {
+                error!("virtio queue available ring is unreadable: {error:?}");
+                0
+            }
+        }
     }
 
     /// Checks if the driver has made any descriptor chains available in the avail ring.
@@ -585,7 +600,7 @@ impl Queue {
 
     /// Pop the first available descriptor chain from the avail ring.
     pub fn pop<'b>(&mut self, mem: &'b GuestMemoryMmap) -> Option<DescriptorChain<'b>> {
-        if self.len(mem) == 0 || self.actual_size() == 0 {
+        if self.actual_size() == 0 || self.len(mem) == 0 {
             return None;
         }
 
@@ -618,11 +633,16 @@ impl Queue {
         fence(Ordering::Acquire);
 
         // `self.is_valid()` already performed all the bound checks on the descriptor table
-        // and virtq rings, so it's safe to unwrap guest memory reads and to use unchecked
-        // offsets.
-        let desc_index: u16 = mem
-            .read_obj(self.avail_ring.unchecked_add(u64::from(index_offset)))
-            .unwrap();
+        // and virtq rings, so the offset cannot overflow; the read is still checked so that a
+        // queue that skipped validation fails the pop instead of the VMM.
+        let desc_index: u16 =
+            match mem.read_obj(self.avail_ring.unchecked_add(u64::from(index_offset))) {
+                Ok(desc_index) => desc_index,
+                Err(error) => {
+                    error!("virtio queue available ring entry is unreadable: {error:?}");
+                    return None;
+                }
+            };
 
         let chain =
             DescriptorChain::checked_new(mem, self.desc_table, self.actual_size(), desc_index)?;
@@ -1304,6 +1324,43 @@ pub(crate) mod tests {
         q.used_ring = GuestAddress(0x1001);
         assert!(!q.is_valid(m));
         q.used_ring = vq.used_start();
+    }
+
+    #[test]
+    fn a_ring_that_starts_in_a_memory_hole_is_invalid_and_never_read() {
+        // Two regions with a hole between them, like RAM below and above the 32-bit MMIO gap.
+        let m = &GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 0x10000),
+            (GuestAddress(0x20000), 0x2000),
+        ])
+        .unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+        let mut q = vq.create_queue();
+        assert!(q.is_valid(m));
+
+        // The available ring starts in the hole and ends inside the second region.
+        q.avail_ring = GuestAddress(0x1fff0);
+        assert!(!q.is_valid(m));
+        // A device that got such a queue anyway finds it empty instead of panicking.
+        assert_eq!(q.len(m), 0);
+        assert!(q.pop(m).is_none());
+
+        // The same for the descriptor table and the used ring.
+        q.avail_ring = vq.avail.flags.location;
+        q.desc_table = GuestAddress(0x1ff00);
+        assert!(!q.is_valid(m));
+        q.desc_table = vq.dtable[0].addr.location;
+        q.used_ring = GuestAddress(0x1ffc0);
+        assert!(!q.is_valid(m));
+    }
+
+    #[test]
+    fn a_queue_the_driver_never_made_ready_is_empty() {
+        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0x1000), 0x10000)]).unwrap();
+        // Never configured: size 0 and every ring at guest address 0, which is not RAM here.
+        let mut q = Queue::new(16);
+        assert_eq!(q.len(m), 0);
+        assert!(q.pop(m).is_none());
     }
 
     #[test]
