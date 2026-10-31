@@ -1,6 +1,7 @@
 name: Code Formatting
 on:
   pull_request:
+  workflow_dispatch:
   push:
     branches: [task/t883-device-hardening-ci]
 
