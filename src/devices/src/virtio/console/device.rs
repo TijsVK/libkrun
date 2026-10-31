@@ -247,6 +247,20 @@ impl Console {
             }
 
             log::trace!("VirtioConsoleControl cmd: {cmd:?}");
+            let names_a_port = matches!(
+                cmd.event,
+                control_event::VIRTIO_CONSOLE_PORT_READY | control_event::VIRTIO_CONSOLE_PORT_OPEN
+            );
+            // The guest picks the id; one past the configured ports must not index them.
+            if names_a_port && cmd.id as usize >= self.ports.len() {
+                log::error!(
+                    "Console control event {:x} for unknown port {} ({} ports)",
+                    cmd.event,
+                    cmd.id,
+                    self.ports.len()
+                );
+                continue;
+            }
             match cmd.event {
                 control_event::VIRTIO_CONSOLE_DEVICE_READY => {
                     log::debug!(
@@ -815,5 +829,60 @@ mod tests {
         let mut reserved = state;
         *reserved.last_mut().unwrap() |= 0x80;
         assert!(source.validate_device_state(&reserved).is_err());
+    }
+
+    #[test]
+    fn console_control_ignores_port_ids_past_the_configured_ports() {
+        use vm_memory::Bytes;
+
+        use crate::virtio::queue::tests::VirtQueue;
+
+        let mut console = Console::new(vec![port("agent", 32)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap();
+        // The guest's control messages: PORT_READY and PORT_OPEN for ports it was never offered.
+        let messages = [
+            (0x4000, control_event::VIRTIO_CONSOLE_PORT_READY, 9),
+            (0x5000, control_event::VIRTIO_CONSOLE_PORT_OPEN, 1),
+        ];
+        let ring = VirtQueue::new(GuestAddress(0), &mem, 16);
+        for (slot, (addr, event, id)) in messages.into_iter().enumerate() {
+            mem.write_obj(
+                VirtioConsoleControl {
+                    id,
+                    event,
+                    value: 1,
+                },
+                GuestAddress(addr),
+            )
+            .unwrap();
+            ring.dtable[slot].set(addr, size_of::<VirtioConsoleControl>() as u32, 0, 0);
+            ring.avail.ring[slot].set(slot as u16);
+        }
+        ring.avail.idx.set(messages.len() as u16);
+
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "test-console".into()).unwrap();
+        let queues = console
+            .queue_config()
+            .iter()
+            .enumerate()
+            .map(|(index, config)| {
+                let queue = if index == CONTROL_TXQ_INDEX {
+                    ring.create_queue()
+                } else {
+                    Queue::new(config.size)
+                };
+                DeviceQueue::new(queue, Arc::new(EventFd::new(0).unwrap()))
+            })
+            .collect();
+        console.activate(mem.clone(), interrupt, queues).unwrap();
+
+        assert!(console.process_control_tx());
+        assert_eq!(
+            ring.used.idx.get(),
+            2,
+            "both messages are returned to the guest"
+        );
+        assert!(!console.ports[0].is_active());
     }
 }
